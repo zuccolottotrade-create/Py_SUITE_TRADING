@@ -31,7 +31,8 @@ def get_kpi_config_dir() -> Path:
     if v:
         return Path(v)
 
-    return get_suite_root() / "_data" / "KPI Configurazione"
+    # KPI Configurazione è in root (non sotto _data)
+    return get_suite_root() / "KPI Configurazione"
 
 
 KPI_CONFIG_DIR = get_kpi_config_dir()

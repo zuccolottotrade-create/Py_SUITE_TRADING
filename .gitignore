@@ -18,3 +18,11 @@ _data/
 # Editor
 .idea/
 .vscode/
+
+# Python artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Local data
+KPI Configurazione/
