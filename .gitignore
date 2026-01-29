@@ -26,3 +26,9 @@ __pycache__/
 
 # Local data
 KPI Configurazione/
+
+# runtime logs
+_logs/
+
+# runtime logs
+_logs/
