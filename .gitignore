@@ -32,3 +32,11 @@ _logs/
 
 # runtime logs
 _logs/
+
+# workspace folders (local)
+5. Strategy Creator/
+Area di Lavoro_doc/
+Github_documenti/
+
+# macOS
+.DS_Store
