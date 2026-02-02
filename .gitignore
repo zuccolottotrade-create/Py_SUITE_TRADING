@@ -58,3 +58,8 @@ Github_documenti/
 # Config locali non riproducibili
 ########################
 KPI Configurazione/
+# duplicated / flat module copies (workspace only)
+1.1 Controllo_coerenza_dati/cli.py
+1.1 Controllo_coerenza_dati/engine.py
+1.1 Controllo_coerenza_dati/io.py
+1.1 Controllo_coerenza_dati/rules/
