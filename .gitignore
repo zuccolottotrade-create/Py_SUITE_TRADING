@@ -1,42 +1,60 @@
+########################
 # Python
+########################
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 
+########################
 # Virtualenv
+########################
 .venv/
 
-# Backup
-*.bak
-
-# Dati generati
-_data/
-*.csv
-
+########################
 # macOS
+########################
 .DS_Store
 
-# Editor
+########################
+# Editor / IDE
+########################
 .idea/
 .vscode/
 
-# Python artifacts
-*.egg-info/
-__pycache__/
-*.pyc
+########################
+# Backup / temporanei
+########################
+*.bak
+*.bak.*
+*.bak.command
+* copia.command
+*~
 
-# Local data
-KPI Configurazione/
-
-# runtime logs
+########################
+# Runtime logs
+########################
 _logs/
 
-# runtime logs
-_logs/
+########################
+# Dati generati (NON template)
+########################
+_data/
+# ⚠️ i CSV NON vanno ignorati globalmente
+# i dati di runtime stanno solo in _data/
 
-# workspace folders (local)
-5. Strategy Creator/
+########################
+# Workspace locali (non versionati)
+########################
 Area di Lavoro_doc/
 Github_documenti/
 
-# macOS
-.DS_Store
+########################
+# Strategy Creator – workspace locale
+########################
+5. Strategy Creator/
+
+########################
+# Config locali non riproducibili
+########################
+KPI Configurazione/
