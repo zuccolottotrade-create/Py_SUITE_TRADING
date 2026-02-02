@@ -63,3 +63,5 @@ KPI Configurazione/
 1.1 Controllo_coerenza_dati/engine.py
 1.1 Controllo_coerenza_dati/io.py
 1.1 Controllo_coerenza_dati/rules/
+# pipeline launcher copies
+Pipeline Launcher/*copia*.command
