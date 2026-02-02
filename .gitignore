@@ -68,3 +68,12 @@ Pipeline Launcher/*copia*.command
 # generated reports
 reports/
 Pipeline Launcher/*copia*.command
+# local backups / variants
+*.bak.py
+*.bak_*.py
+*_updated.py
+*_interactive_*.py
+*_PIPELINE_*.py
+*_maxdd_*.py
+*_dd_*.py
+
