@@ -1,0 +1,49 @@
+--- report_strategia.py
++++ report_strategia.py
+@@ -1458,8 +1458,13 @@
+             pass
+ 
+         # ------------------------------------------------------------
++                # ------------------------------------------------------------
+         # Alpha Strategy vs Buy & Hold (Full Holding)
+         # Alpha = Net Profit (Strategy) - Buy & Hold Profit (Full Holding)
++        #
++        # Strategy Outperformance (Solution A):
++        # - confronto coerente: Strategy (Net Profit, che a questo punto è MTM/Final) vs Buy&Hold (Full Holding)
++        # - formula percentuale: (Strategy - Buy&Hold) / |Buy&Hold| * 100
+         # ------------------------------------------------------------
+         try:
+             strat_net = _get_metric_raw(report_df, "Net Profit")
+@@ -1467,13 +1472,22 @@
+ 
+             if math.isfinite(strat_net) and math.isfinite(hold_full):
+                 alpha = float(strat_net) - float(hold_full)
+-
+                 report_df = _upsert_metric(
+                     report_df,
+                     "Alpha vs Buy&Hold (Full Holding)",
+                     float(alpha),
+                     "€",
+                 )
++
++                # Strategy Outperformance (%) vs Buy&Hold (Full Holding)
++                if float(hold_full) != 0.0:
++                    outperf_pct = (float(alpha) / abs(float(hold_full))) * 100.0
++                    report_df = _upsert_metric(
++                        report_df,
++                        "Strategy Outperformance",
++                        float(outperf_pct),
++                        "%",
++                    )
+         except Exception:
+             pass
+ 
+@@ -2053,6 +2067,8 @@
+             "Gross Loss (Losing Trades Only)",
+             "Net Profit",
+             "Buy & Hold Profit (FILO)",
++            "Buy & Hold Profit (Full Holding)",
++            "Equity End Buy&Hold (Full Holding)",
+             "Strategy Outperformance",
+             "Total Return",
+             "Number of Operations (IN+OUT)",

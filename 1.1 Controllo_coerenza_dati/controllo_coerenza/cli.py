@@ -77,9 +77,18 @@ def resolve_data_dir(output_dir_arg: str | None) -> Path:
     # parents[2] = .../1.1 Controllo_coerenza_dati
     # parents[3] = .../Py_SUITE_TRADING
     try:
-        suite_root = Path(__file__).resolve().parents[3]
+        # PY_SUITE_ROOT deve puntare a /Users/claudio 1/Py_SUITE_TRADING
+        suite_root = Path(
+            os.environ.get(
+                "PY_SUITE_ROOT",
+                Path(__file__).resolve().parents[4]
+            )
+        ).expanduser().resolve()
     except Exception:
-        suite_root = Path.cwd().resolve()
+        raise RuntimeError("Impossibile risolvere PY_SUITE_ROOT")
+
+    print("[DEBUG] suite_root =", suite_root)
+    print("[DEBUG] data_dir finale =", suite_root / "_data" / "Test Data")
 
     return (suite_root / "_data" / "Test Data").resolve()
 

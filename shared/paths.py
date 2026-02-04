@@ -1,38 +1,34 @@
+# /Users/claudio 1/Py_SUITE_TRADING/shared/paths.py
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
+# Suite root = cartella che contiene "shared"
+SUITE_ROOT = Path(__file__).resolve().parents[1]
 
-def _env_path(name: str) -> Path | None:
-    v = os.getenv(name, "").strip()
-    return Path(v) if v else None
+def _default_data_dir() -> Path:
+    """
+    Default data dir: <SUITE_ROOT>/_data
+    (coerente con naming Py_SUITE_TRADING)
+    """
+    return (SUITE_ROOT / "_data").resolve()
 
+# 1) Se esiste una variabile d'ambiente esplicita, usala
+#    (questa è la forma più pulita in pipeline)
+_env = os.environ.get("PY_SUITE_DATA_DIR") or os.environ.get("PY_SUITE_TRADING_DATA_DIR")
 
-def get_suite_root() -> Path:
-    root = _env_path("PY_SUITE_ROOT")
-    if root:
-        return root
-    return Path(__file__).resolve().parents[1]
+# 2) DATA_DIR finale
+DATA_DIR = str(Path(_env).expanduser().resolve()) if _env else str(_default_data_dir())
 
+def _default_kpi_config_dir() -> Path:
+    """
+    Directory di configurazione KPI (xlsx/template).
+    Default: <SUITE_ROOT>/2. PyKPI_calcolo/config
+    """
+    return (SUITE_ROOT / "2. PyKPI_calcolo" / "config").resolve()
 
-def get_data_dir() -> Path:
-    dd = _env_path("PY_SUITE_DATA_DIR")
-    if dd:
-        return dd
-    return get_suite_root() / "_data" / "Test Data"
+_env_cfg = os.environ.get("PY_KPI_CONFIG_DIR") or os.environ.get("KPI_CONFIG_DIR")
 
+KPI_CONFIG_DIR = str(Path(_env_cfg).expanduser().resolve()) if _env_cfg else str(_default_kpi_config_dir())
 
-SUITE_ROOT = get_suite_root()
-DATA_DIR = get_data_dir()
-
-def get_kpi_config_dir() -> Path:
-    v = os.getenv("PY_SUITE_KPI_CONFIG_DIR", "").strip()
-    if v:
-        return Path(v)
-
-    # KPI Configurazione è in root (non sotto _data)
-    return get_suite_root() / "KPI Configurazione"
-
-
-KPI_CONFIG_DIR = get_kpi_config_dir()

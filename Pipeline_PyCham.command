@@ -89,6 +89,11 @@ run_cmd_file() {
   require_file "$cmd" || { pause; return 1; }
 
   # Forziamo interattivo per i moduli pipeline
+    # --- FIX: pulizia variabili pipeline (mantiene l'interattività nei moduli singoli) ---
+  unset PY_SUITE_SIGNAL_INPUT_CSV
+  unset PY_SUITE_SIGNAL_INPUT
+  unset PY_SUITE_SIGNAL_LATEST
+  unset PIPELINE_MODE
   PIPELINE_MODE="0" "$cmd"
   local rc=$?
 
