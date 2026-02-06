@@ -11,15 +11,17 @@ import pandas as pd
 def list_regime_modules(shared_dir: Path) -> list[str]:
     """
     Elenca i moduli selezionabili.
-    Convenzione: shared/regime_classifier_*.py
+    Convenzione: shared/regime_*.py (es: regime_classifier_1.py)
     Ritorna lo stem del file (senza .py).
     """
     shared_dir = Path(shared_dir).resolve()
 
     return sorted(
         p.stem
-        for p in shared_dir.glob("regime_classifier*.py")
-        if p.is_file() and not p.name.startswith("__")
+        for p in shared_dir.glob("regime_*.py")
+        if p.is_file()
+        and not p.name.startswith("__")
+        and p.name != "loader_regime.py"
     )
 
 
@@ -39,6 +41,7 @@ def load_regime_apply(shared_dir: Path, module_name: str) -> Callable[[pd.DataFr
     - preferisce apply_regime(df) (nuova convenzione)
     - fallback su apply(df) (retrocompatibilità)
     """
+
     shared_dir = Path(shared_dir).resolve()
     path = (shared_dir / f"{module_name}.py").resolve()
 

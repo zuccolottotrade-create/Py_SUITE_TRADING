@@ -7,7 +7,148 @@ from typing import Literal
 
 import json
 import os
+from pathlib import Path
+
 print("[DEBUG] regime_classifier_1 loaded from:", __file__)
+
+
+# =============================================================================
+# Config filtro (CSV) - default per fine tuning
+# Standard: _data/config_filtro_regime/config_filtro_<nome_modulo>.csv
+# Esempio qui: config_filtro_regime_classifier_1.csv
+# NOTE:
+# - separatore: ;
+# - decimali: VIRGOLA (es: 20,0)  -> il punto (20.0) è considerato ERRORE
+# - colonne attese: param ; value ; note
+# =============================================================================
+
+def _suite_root_from_shared() -> Path:
+    """
+    __file__ è in <SUITE_ROOT>/shared/regime_classifier_1.py
+    quindi parents[1] = <SUITE_ROOT>.
+    """
+    return Path(__file__).resolve().parents[1]
+
+def _config_dir_regime() -> Path:
+    return (_suite_root_from_shared() / "_data" / "config_filtro_regime").resolve()
+
+def _config_path_this_filter() -> Path:
+    # nome file standard: config_filtro_<nome_modulo>.csv
+    return (_config_dir_regime() / "config_filtro_regime_classifier_1.csv").resolve()
+
+def _parse_decimal_comma(value: str, *, param: str) -> float:
+    """
+    Regola: accetta solo virgola decimale.
+    - "20,0" OK
+    - "20.0" ERRORE (standard richiesto)
+    - "2" OK
+    """
+    s = (value or "").strip()
+    if s == "":
+        raise ValueError(f"[REGIME_L1][CFG] value vuoto per param='{param}'")
+
+    # vieto esplicitamente il punto come decimale
+    if "." in s:
+        raise ValueError(
+            f"[REGIME_L1][CFG] formato non valido per param='{param}': '{s}'. "
+            f"Usa la virgola decimale (es: 20,0) e NON il punto (20.0)."
+        )
+
+    # converto virgola -> punto per float()
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception as e:
+        raise ValueError(f"[REGIME_L1][CFG] numero non valido per param='{param}': '{value}' ({e})")
+
+REGIME_L1_REQUIRED_PARAMS = [
+    "adx_trend_enter",
+    "adx_trend_exit",
+    "adx_range_enter",
+    "adx_range_exit",
+    "atr_volatile_enter",
+    "atr_volatile_exit",
+    "confirm_bars_trend",
+    "confirm_bars_range",
+    "confirm_bars_volatile",
+]
+
+
+
+
+
+def _load_filter_defaults_from_csv() -> dict:
+    """
+    Carica override parametri da:
+      _data/config_filtro_regime/config_filtro_regime_classifier_1.csv
+
+    Ritorna dict con chiavi dei parametri L1.
+    Se il file non esiste -> {} (nessun override).
+    """
+    path = _config_path_this_filter()
+
+    if not path.exists():
+        print("\n❌❌❌  ALERT CONFIG FILTRO REGIME  ❌❌❌")
+        print("[REGIME_L1][CFG] File di configurazione OBBLIGATORIO NON trovato:")
+        print(f"  {path}\n")
+        print("Policy: niente fallback. Esecuzione interrotta.\n")
+        raise SystemExit(1)
+
+    # leggiamo come stringhe per controllare il formato numerico (virgola)
+    df_cfg = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
+
+    # --- schema richiesto per il CSV config ---
+    required_cols = {"param", "value"}
+    optional_cols = {"note"}
+
+    missing = required_cols - set(df_cfg.columns)
+    if missing:
+        raise ValueError(f"[REGIME_L1][CFG] colonne mancanti in {path.name}: {sorted(missing)}")
+
+    # colonna opzionale: se manca, la creiamo vuota per stabilità downstream
+    if "note" not in df_cfg.columns:
+        df_cfg["note"] = ""
+
+    out: dict = {}
+    for _, r in df_cfg.iterrows():
+        param = (r["param"] or "").strip()
+        value = (r["value"] or "").strip()
+
+        if not param:
+            continue
+
+        # Qui vogliamo SOLO parametri numerici.
+        # Se in futuro serve un label stringa, lo gestiamo separatamente.
+        num = _parse_decimal_comma(value, param=param)
+
+        # cast int per i confirm_bars_*
+        if param.startswith("confirm_bars_"):
+            out[param] = int(num)
+        else:
+            out[param] = float(num)
+
+    # --- REQUIRED params check (policy: niente fallback) ---
+    missing_required = [k for k in REGIME_L1_REQUIRED_PARAMS if k not in out]
+    if missing_required:
+        print("\n❌❌❌  ALERT CONFIG FILTRO REGIME  ❌❌❌")
+        print(f"[REGIME_L1][CFG] File presente ma INCOMPLETO: {path.name}")
+        print("Parametri mancanti:")
+        for m in missing_required:
+            print(f"  - {m}")
+        print("\nPolicy: niente fallback. Esecuzione interrotta.\n")
+        raise SystemExit(1)
+
+
+    if out:
+        print(
+            "[DEBUG][REGIME_L1][CFG] override da CSV applicati:",
+            ", ".join(f"{k}={v}" for k, v in sorted(out.items()))
+        )
+    else:
+        print("[DEBUG][REGIME_L1][CFG] CSV presente ma nessun override valido trovato")
+
+    return out
+
 
 
 RegimeFilterL1 = Literal["OFF", "L1"]
@@ -29,12 +170,11 @@ REQUIRED_KPI_COLS = [
 ]
 
 def validate_input_L1(df):
-    validate_input_L1(df)
-    missing = [c for c in REQUIRED_KPI_COLS_L1 if c not in df.columns]
-    if missing:
-        raise ValueError(
-            "[regime_classifier_1:L1] KPI mancanti: " + ", ".join(missing)
-        )
+    """
+    Alias esplicito: L1 usa lo stesso validate_input() (contract base + KPI).
+    """
+    validate_input(df)
+
 
 def validate_input(df):
     """
@@ -57,51 +197,26 @@ def validate_input(df):
 
 
 
-# =============================================================================
-# REGIME_L1 baseline (FROZEN) - v1.0
-# =============================================================================
-REGIME_L1_VERSION = "1.0"
 
-# Baseline congelata (non toccare senza bump di versione)
-REGIME_L1_BASELINE = dict(
-    adx_trend_enter=20.0,
-    adx_trend_exit=18.0,
-    adx_range_enter=15.0,
-    adx_range_exit=17.0,
-    atr_volatile_enter=2.0,
-    atr_volatile_exit=1.7,
-    confirm_bars_trend=2,
-    confirm_bars_range=2,
-    confirm_bars_volatile=2,
-    lateral_label="LATERAL",
-)
-
-# Profili (preset) per fine tuning: aggiungi qui nuovi preset
-# Nota: NON modificare REGIME_L1_BASELINE; crea un profilo nuovo.
-REGIME_L1_PROFILES = {
-    "BASELINE": REGIME_L1_BASELINE,
-    # esempi (commentati): duplicali e cambia solo ciò che vuoi
-    # "TUNE_SOFT_RANGE": {**REGIME_L1_BASELINE, "adx_range_enter": 16.0, "adx_range_exit": 18.0},
-    # "TUNE_MORE_VOL":   {**REGIME_L1_BASELINE, "atr_volatile_enter": 1.5, "atr_volatile_exit": 1.3},
-}
 
 def resolve_regime_l1_params(
     profile: str | None = None,
     overrides: dict | None = None,
 ) -> dict:
     """
-    Resolve parametri L1:
-    - profile: nome preset (default: ENV REGIME_L1_PROFILE, altrimenti BASELINE)
-    - overrides: dict runtime (sovrascrive il profilo)
-    - ENV overrides: REGIME_L1_OVERRIDES_JSON (JSON string) opzionale
+    Resolve parametri L1 (ordine priorità crescente):
+      0) profilo (BASELINE o preset)
+      1) override da CSV config_filtro_regime_classifier_1.csv (se presente)
+      2) override da ENV JSON (REGIME_L1_OVERRIDES_JSON)
+      3) override da argomento python (massima priorità)
     """
-    p = (profile or os.getenv("REGIME_L1_PROFILE") or "BASELINE").strip().upper()
-    if p not in REGIME_L1_PROFILES:
-        raise ValueError(f"[REGIME_L1] Unknown profile: {p}. Available={list(REGIME_L1_PROFILES.keys())}")
 
-    params = dict(REGIME_L1_PROFILES[p])
 
-    # 1) override da ENV JSON (se presente)
+    params = _load_filter_defaults_from_csv()  # OBBLIGATORIO e completo (altrimenti SystemExit)
+
+
+
+    # 2) override da ENV JSON (se presente)
     env_json = os.getenv("REGIME_L1_OVERRIDES_JSON", "").strip()
     if env_json:
         try:
@@ -112,26 +227,29 @@ def resolve_regime_l1_params(
         except Exception as e:
             raise ValueError(f"[REGIME_L1] Bad REGIME_L1_OVERRIDES_JSON: {e}")
 
-    # 2) override da argomento python (massima priorità)
+    # 3) override da argomento python (massima priorità)
     if overrides:
         params.update(overrides)
 
     return params
 
+_AUTO = object()
+
 def update_regime_state_Livello1(
     df: pd.DataFrame,
     *,
     # --- soglie (enter/exit = hysteresis) ---
-    adx_trend_enter: float = 20.0,
-    adx_trend_exit: float = 18.0,
-    adx_range_enter: float = 15.0,
-    adx_range_exit: float = 17.0,
-    atr_volatile_enter: float = 2.0,
-    atr_volatile_exit: float = 1.7,
+    adx_trend_enter: float = _AUTO,
+    adx_trend_exit: float = _AUTO,
+    adx_range_enter: float = _AUTO,
+    adx_range_exit: float = _AUTO,
+    atr_volatile_enter: float = _AUTO,
+    atr_volatile_exit: float = _AUTO,
     # --- debounce (barre consecutive richieste) ---
-    confirm_bars_trend: int = 2,
-    confirm_bars_volatile: int = 2,
-    confirm_bars_range: int = 2,
+    confirm_bars_trend: int = _AUTO,
+    confirm_bars_volatile: int = _AUTO,
+    confirm_bars_range: int = _AUTO,
+
     # --- output columns ---
     col_raw: str = "REGIME_L1_RAW",
     col_out: str = "REGIME_L1",
@@ -162,6 +280,32 @@ def update_regime_state_Livello1(
       2) Volatile
       3) Lateral
     """
+    # ------------------------------------------------------------
+    # Policy: nessun default hardcoded. Se non passi esplicitamente
+    # i parametri, li risolvo dal CSV obbligatorio (o SystemExit).
+    # ------------------------------------------------------------
+    resolved = resolve_regime_l1_params()
+
+    if adx_trend_enter is _AUTO: adx_trend_enter = float(resolved["adx_trend_enter"])
+    if adx_trend_exit  is _AUTO: adx_trend_exit  = float(resolved["adx_trend_exit"])
+    if adx_range_enter is _AUTO: adx_range_enter = float(resolved["adx_range_enter"])
+    if adx_range_exit  is _AUTO: adx_range_exit  = float(resolved["adx_range_exit"])
+    if atr_volatile_enter is _AUTO: atr_volatile_enter = float(resolved["atr_volatile_enter"])
+    if atr_volatile_exit  is _AUTO: atr_volatile_exit  = float(resolved["atr_volatile_exit"])
+
+    if confirm_bars_trend    is _AUTO: confirm_bars_trend    = int(resolved["confirm_bars_trend"])
+    if confirm_bars_range    is _AUTO: confirm_bars_range    = int(resolved["confirm_bars_range"])
+    if confirm_bars_volatile is _AUTO: confirm_bars_volatile = int(resolved["confirm_bars_volatile"])
+
+    print(
+        "[DEBUG][REGIME_L1] usando parametri:",
+        f"adx_trend_enter={adx_trend_enter}, adx_trend_exit={adx_trend_exit}, "
+        f"adx_range_enter={adx_range_enter}, adx_range_exit={adx_range_exit}, "
+        f"atr_volatile_enter={atr_volatile_enter}, atr_volatile_exit={atr_volatile_exit}, "
+        f"confirm_bars_trend={confirm_bars_trend}, confirm_bars_range={confirm_bars_range}, "
+        f"confirm_bars_volatile={confirm_bars_volatile}"
+    )
+
 
     required_cols = [
         "close",
@@ -352,18 +496,36 @@ def apply_regime(df, cfg=None):
 
 
 def _regime_l1_preflight_qc() -> None:
-    expected = (20.0, 18.0, 15.0, 17.0, 2.0, 1.7, 2, 2, 2, "LATERAL")
-    b = REGIME_L1_BASELINE
-    sig = (
-        b["adx_trend_enter"], b["adx_trend_exit"],
-        b["adx_range_enter"], b["adx_range_exit"],
-        b["atr_volatile_enter"], b["atr_volatile_exit"],
-        b["confirm_bars_trend"], b["confirm_bars_range"], b["confirm_bars_volatile"],
-        b["lateral_label"],
+    b = globals().get("REGIME_L1_BASELINE", None)
+    if b is None:
+        raise RuntimeError("[REGIME_L1] REGIME_L1_BASELINE is not defined (load/config order issue).")
+
+
+    required_keys = (
+        "adx_trend_enter",
+        "adx_trend_exit",
+        "adx_range_enter",
+        "adx_range_exit",
+        "atr_volatile_enter",
+        "atr_volatile_exit",
+        "confirm_bars_trend",
+        "confirm_bars_range",
+        "confirm_bars_volatile",
+        "lateral_label",
     )
-    if sig != expected:
+
+    missing = [k for k in required_keys if k not in b]
+    if missing:
         raise RuntimeError(
-            f"[REGIME_L1] Baseline changed without bump. version={REGIME_L1_VERSION} sig={sig}"
+            f"[REGIME_L1] Missing keys in baseline config: {missing}"
         )
 
-_regime_l1_preflight_qc()
+    if not isinstance(b["lateral_label"], str):
+        raise RuntimeError(
+            "[REGIME_L1] lateral_label must be a string"
+        )
+
+    if REGIME_L1_VERSION is None:
+        raise RuntimeError(
+            "[REGIME_L1] REGIME_L1_VERSION must be explicitly set"
+        )

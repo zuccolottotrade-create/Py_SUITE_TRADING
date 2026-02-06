@@ -219,6 +219,14 @@ run_build_config() {
     python -m strategy_mapper.cli build-config --interactive
 }
 
+run_wizard_regime_filter() {
+  run_strategy_step "B4 - Regime Filter Wizard (apply + report)" \
+    python3 "$PY_SUITE_ROOT/shared/wizard_regime_filter.py"
+
+
+}
+
+
 run_strategy_completa() {
   tty_sane
   say "======================================"
@@ -256,7 +264,8 @@ menu() {
     say "  7) B1  Classificazione Operativa (CLEAN_ -> CLASSIFICAZIONE_)"
     say "  8) B2  Strategy Mapper (map-strategies)"
     say "  9) B3  Build Config (build-config)"
-    say " 10) B4  Strategy Creator completo (B1->B3)"
+    say " 10) B4  Regime Filter Wizard (apply + report)"
+    say " 11) B5  Strategy Creator completo (B1->B3)"
     say ""
     say "  0) Esci"
     say "--------------------------------------------------------------------"
@@ -272,7 +281,8 @@ menu() {
       7)  run_classificazione_operativa ;;
       8)  run_map_strategies ;;
       9)  run_build_config ;;
-      10) run_strategy_completa ;;
+      10) run_wizard_regime_filter ;;
+      11) run_strategy_completa ;;
       0)  say "👋 Fine."; exit 0 ;;
       *)  say "Scelta non valida."; pause ;;
     esac
