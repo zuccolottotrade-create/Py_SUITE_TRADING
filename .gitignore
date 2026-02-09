@@ -77,3 +77,6 @@ Pipeline Launcher/*copia*.command
 *_maxdd_*.py
 *_dd_*.py
 
+
+# backup command files
+*.BAK*.command
