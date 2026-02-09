@@ -83,28 +83,31 @@ run_cmd_file() {
   local cmd="$2"
   local mode="${3:-0}"   # 0=interattivo, 1=pipeline
 
+
+
   tty_sane
   say "======================================"
   say " $label"
   say "======================================"
   require_file "$cmd" || { pause; return 1; }
 
-  local rc=0
-  set +e
   if [[ "$mode" == "1" ]]; then
-    # Pipeline: NON pulire le variabili, abilita PIPELINE_MODE=1
-    PIPELINE_MODE="1" "$cmd"
-    rc=$?
-  else
-    # Interattivo: pulizia variabili pipeline + PIPELINE_MODE=0
-    unset PY_SUITE_SIGNAL_INPUT_CSV
-    unset PY_SUITE_SIGNAL_INPUT
-    unset PY_SUITE_SIGNAL_LATEST
-    unset PIPELINE_MODE
-    PIPELINE_MODE="0" "$cmd"
-    rc=$?
-  fi
-  set -e
+  # Pipeline: NON puliamo le variabili, abilitiamo PIPELINE_MODE=1
+  PIPELINE_MODE="1" "$cmd"
+else
+  # Interattivo: pulizia variabili pipeline e PIPELINE_MODE=0
+  if [[ "$mode" == "1" ]]; then
+  # Pipeline: NON pulire, abilita PIPELINE_MODE=1
+  PIPELINE_MODE="1" "$cmd"
+else
+  # Interattivo: pulizia variabili pipeline + PIPELINE_MODE=0
+  unset PY_SUITE_SIGNAL_INPUT_CSV
+  unset PY_SUITE_SIGNAL_INPUT
+  unset PY_SUITE_SIGNAL_LATEST
+  unset PIPELINE_MODE
+  PIPELINE_MODE="0" "$cmd"
+fi
+
 
   tty_sane
   say ""
@@ -194,7 +197,6 @@ run_report() {
     "$PY_SUITE_ROOT/4. REPORT strategia/Report_strategia.command"
 }
 
-
 run_pipeline_completa() {
   tty_sane
   say "======================================"
@@ -209,9 +211,8 @@ run_pipeline_completa() {
   run_strategia || return 1
   run_report || return 1
   return 0
-}
 
-run_pipeline_completa_pipeline() {
+  run_pipeline_completa_pipeline() {
   tty_sane
   say "======================================"
   say " A7 - PIPELINE COMPLETA (PIPELINE_MODE=1)"
@@ -219,13 +220,15 @@ run_pipeline_completa_pipeline() {
   say "Eseguirò i moduli in sequenza in modalità pipeline (non interattiva)."
   pause
 
-  run_cmd_file "A1 - estrazione_pro"          "$PY_SUITE_ROOT/1. estrazione_pro/estrazione_pro.command" 1 || return 1
-  run_cmd_file "A2 - Controllo_coerenza_dati" "$PY_SUITE_ROOT/1.1 Controllo_coerenza_dati/Controllo_coerenza_dati.command" 1 || return 1
-  run_cmd_file "A3 - PyKPI_calcolo"           "$PY_SUITE_ROOT/2. PyKPI_calcolo/PyKPI_calcolo.command" 1 || return 1
-  run_cmd_file "A4 - Run_strategia"           "$PY_SUITE_ROOT/3. Run_strategia/Run_strategia.command" 1 || return 1
-  run_cmd_file "A5 - Report_strategia"        "$PY_SUITE_ROOT/4. REPORT strategia/Report_strategia.command" 1 || return 1
+  run_cmd_file "A1 - estrazione_pro"     "$PY_SUITE_ROOT/1. estrazione_pro/estrazione_pro.command" 1 || return 1
+  run_cmd_file "A2 - Controllo_coerenza" "$PY_SUITE_ROOT/1.1 Controllo_coerenza_dati/Controllo_coerenza_dati.command" 1 || return 1
+  run_cmd_file "A3 - PyKPI_calcolo"      "$PY_SUITE_ROOT/2. PyKPI_calcolo/PyKPI_calcolo.command" 1 || return 1
+  run_cmd_file "A4 - Run_strategia"      "$PY_SUITE_ROOT/3. Run_strategia/Run_strategia.command" 1 || return 1
+  run_cmd_file "A5 - Report_strategia"   "$PY_SUITE_ROOT/4. REPORT strategia/Report_Strategia.command" 1 || return 1
 
   return 0
+}
+
 }
 
 # ============================================================
@@ -285,16 +288,15 @@ menu() {
     say "  3) A3  PyKPI_calcolo"
     say "  4) A4  Run_strategia"
     say "  5) A5  Report_strategia"
-    say "  6) A6  Pipeline completa (INTERATTIVA, A1->A5)"
-    say "  7) A7  Pipeline completa (PIPELINE_MODE=1, A1->A5)"
-
+    say "  6) A6  Pipeline completa (A1->A5)"
+    
     say ""
     say "---------------------  B. STRATEGY CREATOR  ------------------------"
-    say "  8) B1  Classificazione Operativa (CLEAN_ -> CLASSIFICAZIONE_)"
-    say "  9) B2  Strategy Mapper (map-strategies)"
-    say " 10) B3  Build Config (build-config)"
-    say " 11) B4  Regime Filter Wizard (apply + report)"
-    say " 12) B5  Strategy Creator completo (B1->B3)"
+    say "  7) B1  Classificazione Operativa (CLEAN_ -> CLASSIFICAZIONE_)"
+    say "  8) B2  Strategy Mapper (map-strategies)"
+    say "  9) B3  Build Config (build-config)"
+    say " 10) B4  Regime Filter Wizard (apply + report)"
+    say " 11) B5  Strategy Creator completo (B1->B3)"
     say ""
     say "  0) Esci"
     say "--------------------------------------------------------------------"
@@ -307,12 +309,11 @@ menu() {
       4)  run_strategia ;;
       5)  run_report ;;
       6)  run_pipeline_completa ;;
-      7)  run_pipeline_completa_pipeline ;;
-      8)  run_classificazione_operativa ;;
-      9)  run_map_strategies ;;
-      10) run_build_config ;;
-      11) run_wizard_regime_filter ;;
-      12) run_strategy_completa ;;
+      7)  run_classificazione_operativa ;;
+      8)  run_map_strategies ;;
+      9)  run_build_config ;;
+      10) run_wizard_regime_filter ;;
+      11) run_strategy_completa ;;
       0)  say "👋 Fine."; exit 0 ;;
       *)  say "Scelta non valida."; pause ;;
     esac
