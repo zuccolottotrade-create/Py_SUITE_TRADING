@@ -1,0 +1,9 @@
+[submodule "2. PyKPI_calcolo"]
+	path = 2. PyKPI_calcolo
+	url = git@github.com:zuccolottotrade-create/PyKPI_calcolo.git
+[submodule "3. Run_strategia"]
+	path = 3. Run_strategia
+	url = git@github.com:zuccolottotrade-create/Run_strategia.git
+[submodule "4. REPORT strategia"]
+	path = 4. REPORT strategia
+	url = git@github.com:zuccolottotrade-create/REPORT_strategia.git
