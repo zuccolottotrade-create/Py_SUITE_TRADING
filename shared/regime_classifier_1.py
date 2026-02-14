@@ -11,70 +11,131 @@ from pathlib import Path
 
 print("[DEBUG] regime_classifier_1 loaded from:", __file__)
 
+def _to_float_series(x: pd.Series) -> pd.Series:
+    """
+    Robust float conversion:
+    - numeric passthrough
+    - EU: "3.060,15" -> 3060.15
+    - US: "3,060.15" -> 3060.15
+    """
+    if pd.api.types.is_numeric_dtype(x):
+        return x.astype("float64")
+
+    s = x.astype(str).str.strip()
+
+    has_dot = s.str.contains(r"\.", regex=True, na=False)
+    has_comma = s.str.contains(r",", regex=True, na=False)
+    both = has_dot & has_comma
+
+    s2 = s.copy()
+
+    # EU: ',' is decimal
+    eu = both & (s.str.rfind(",") > s.str.rfind("."))
+    s2.loc[eu] = (
+        s.loc[eu]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+    # US: '.' is decimal, ',' thousands
+    us = both & ~eu
+    s2.loc[us] = s.loc[us].str.replace(",", "", regex=False)
+
+    # only comma => comma is decimal
+    only_comma = has_comma & ~has_dot
+    s2.loc[only_comma] = s.loc[only_comma].str.replace(",", ".", regex=False)
+
+    out = pd.to_numeric(s2, errors="coerce")
+    return out.astype("float64")
+
+
+
+
+def _pick_col(df, names):
+    """Ritorna il primo nome colonna esistente in df tra una lista di alias."""
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
 
 # =============================================================================
 # Config filtro (CSV) - default per fine tuning
-# Standard: _data/config_filtro_regime/config_filtro_<nome_modulo>.csv
-# Esempio qui: config_filtro_regime_classifier_1.csv
-# NOTE:
-# - separatore: ;
-# - decimali: VIRGOLA (es: 20,0)  -> il punto (20.0) è considerato ERRORE
-# - colonne attese: param ; value ; note
+# Standard: _data/config_filtro_regime/config_filtro_<nome_filtro>.csv
+# NOTE IMPORTANTI:
+# - Questo CSV è OBBLIGATORIO (policy "niente fallback").
+# - I valori devono essere numerici in formato EU (virgola ammessa) es: 0,35
 # =============================================================================
 
-def _suite_root_from_shared() -> Path:
+def _find_repo_root(start: Path) -> Path:
     """
-    __file__ è in <SUITE_ROOT>/shared/regime_classifier_1.py
-    quindi parents[1] = <SUITE_ROOT>.
+    Risale le directory finché trova la root del repo (marker: cartella '_data').
+    Fallback: start.
     """
-    return Path(__file__).resolve().parents[1]
+    p = start.resolve()
+    for _ in range(10):
+        if (p / "_data").exists():
+            return p
+        if p.parent == p:
+            break
+        p = p.parent
+    return start.resolve()
 
-def _config_dir_regime() -> Path:
-    return (_suite_root_from_shared() / "_data" / "config_filtro_regime").resolve()
 
 def _config_path_this_filter() -> Path:
-    # nome file standard: config_filtro_<nome_modulo>.csv
-    return (_config_dir_regime() / "config_filtro_regime_classifier_1.csv").resolve()
-
-def _parse_decimal_comma(value: str, *, param: str) -> float:
     """
-    Regola: accetta solo virgola decimale.
-    - "20,0" OK
-    - "20.0" ERRORE (standard richiesto)
-    - "2" OK
+    Config OBBLIGATORIO:
+      <REPO_ROOT>/_data/config_filtro_regime/config_filtro_regime_classifier_1.csv
+
+    Nota: REPO_ROOT viene risolto risalendo da questo file (non dal CWD),
+    così funziona da qualunque working directory (wizard, pipeline, strategy_creator).
+    """
+    repo_root = _find_repo_root(Path(__file__).resolve())
+    return repo_root / "_data" / "config_filtro_regime" / "config_filtro_regime_classifier_1.csv"
+
+
+def _parse_decimal_comma(value: str, *, param: str = "") -> float:
+    """
+    Parse numeri con virgola decimale italiana.
+    Accetta:
+      - "0,35" -> 0.35
+      - "12"   -> 12.0
+      - "12.5" -> 12.5
     """
     s = (value or "").strip()
-    if s == "":
-        raise ValueError(f"[REGIME_L1][CFG] value vuoto per param='{param}'")
-
-    # vieto esplicitamente il punto come decimale
-    if "." in s:
-        raise ValueError(
-            f"[REGIME_L1][CFG] formato non valido per param='{param}': '{s}'. "
-            f"Usa la virgola decimale (es: 20,0) e NON il punto (20.0)."
-        )
-
-    # converto virgola -> punto per float()
-    s = s.replace(",", ".")
+    if not s:
+        raise ValueError(f"[REGIME_L1][CFG] valore vuoto per param='{param}'")
     try:
+        s = s.replace(",", ".")
         return float(s)
     except Exception as e:
         raise ValueError(f"[REGIME_L1][CFG] numero non valido per param='{param}': '{value}' ({e})")
 
+
 REGIME_L1_REQUIRED_PARAMS = [
+    # --- TREND ---
     "adx_trend_enter",
     "adx_trend_exit",
+    # --- ADX band bassa (RANGE/LATERAL) ---
     "adx_range_enter",
     "adx_range_exit",
+    # --- VOLATILE (ATR_PCT) ---
     "atr_volatile_enter",
     "atr_volatile_exit",
+    # --- RANGE vs LATERAL (REGIME1) ---
+    "atr_range_enter",
+    "atr_range_exit",
+    "bb_width_range_enter",
+    "bb_width_range_exit",
+    # --- BB params (solo fallback se KPI_BB_WIDTH_PCT assente) ---
+    "bb_period",
+    "bb_k",
+    # --- debounce ---
     "confirm_bars_trend",
     "confirm_bars_range",
     "confirm_bars_volatile",
 ]
-
-
-
 
 
 def _load_filter_defaults_from_csv() -> dict:
@@ -156,34 +217,20 @@ RegimeFilterL1 = Literal["OFF", "L1"]
 # ==========================================================
 # Contract / Requirements for this regime classifier
 # ==========================================================
+# Required base columns:
+# - close
+# Required KPI columns:
+# - KPI_EMA_21, KPI_EMA_50, KPI_EMA_200
+# - KPI_ADX_14
+# - KPI_ATR_PCT_14
+#
+# Optional KPI:
+# - KPI_BB_WIDTH_PCT (if missing, we compute BB width from close using bb_period/bb_k from cfg)
+# ==========================================================
 
-REQUIRED_BASE_COLS = [
-    "symbol", "isin", "date", "time", "open", "high", "low", "close", "volume", "datetime"
-]
-
-REQUIRED_KPI_COLS = [
-    "KPI_ATR_14",
-    "KPI_ATR_PCT_14",
-    "KPI_ADX_14",
-    "KPI_EMA_21",
-    "KPI_EMA_50",
-]
-
-def validate_input_L1(df):
-    """
-    Alias esplicito: L1 usa lo stesso validate_input() (contract base + KPI).
-    """
-    validate_input(df)
-
-
-def validate_input(df):
-    """
-    Validate that df contains the minimum columns required by this classifier.
-    Raise ValueError with a clear message if requirements are not met.
-    """
-    missing_base = [c for c in REQUIRED_BASE_COLS if c not in df.columns]
-    missing_kpi = [c for c in REQUIRED_KPI_COLS if c not in df.columns]
-
+def _require_columns(df: pd.DataFrame, base: list[str], kpis: list[str]) -> None:
+    missing_base = [c for c in base if c not in df.columns]
+    missing_kpi = [c for c in kpis if c not in df.columns]
     if missing_base or missing_kpi:
         parts = []
         if missing_base:
@@ -245,11 +292,18 @@ def update_regime_state_Livello1(
     adx_range_exit: float = _AUTO,
     atr_volatile_enter: float = _AUTO,
     atr_volatile_exit: float = _AUTO,
+    # --- RANGE vs LATERAL (REGIME1) ---
+    atr_range_enter: float = _AUTO,
+    atr_range_exit: float = _AUTO,
+    bb_width_range_enter: float = _AUTO,
+    bb_width_range_exit: float = _AUTO,
+    # --- Bollinger (solo se KPI_BB_WIDTH_PCT non presente) ---
+    bb_period: int = _AUTO,
+    bb_k: float = _AUTO,
     # --- debounce (barre consecutive richieste) ---
     confirm_bars_trend: int = _AUTO,
     confirm_bars_volatile: int = _AUTO,
     confirm_bars_range: int = _AUTO,
-
     # --- output columns ---
     col_raw: str = "REGIME_L1_RAW",
     col_out: str = "REGIME_L1",
@@ -258,94 +312,170 @@ def update_regime_state_Livello1(
     col_reason: str = "REGIME_L1_REASON",
 ) -> pd.DataFrame:
     """
-    REGIME – Livello 1 (contesto primario) - versione robusta
+    REGIME – Livello 1 (contesto primario) – implementazione REGIME1 (30m)
 
-    Regimi granulari:
+    Stati canonici:
       - TREND_UP
       - TREND_DOWN
+      - RANGE
+      - LATERAL
       - VOLATILE
-      - LATERAL = mercato non direzionale, ADX medio, nessun trend strutturato,
-          volatilità normale (zona di transizione / congestione ampia)
-
+      - UNKNOWN
 
     Output:
       - REGIME_L1_RAW    : classificazione istantanea (debug/QC)
       - REGIME_L1        : stato stabilizzato (debounce + hysteresis)
-      - REGIME_L1_CODE   : codice numerico stabile
+      - REGIME_L1_CODE   : codice numerico stabile (REGIME1)
       - REGIME_L1_SWITCH : 1 quando cambia stato (su barra), altrimenti 0
-      - REGIME_L1_REASON : driver dominante dello stato RAW (TREND_UP/TREND_DOWN/VOLATILE/RANGE)
+      - REGIME_L1_REASON : driver dominante dello stato RAW
 
-    Priorità RAW (come tua versione):
-      1) Trend
-      2) Volatile
-      3) Lateral
+    Priorità RAW (REGIME1):
+      1) VOLATILE
+      2) TREND (UP/DOWN)
+      3) RANGE
+      4) LATERAL
+      5) UNKNOWN
     """
     # ------------------------------------------------------------
-    # Policy: nessun default hardcoded. Se non passi esplicitamente
-    # i parametri, li risolvo dal CSV obbligatorio (o SystemExit).
+    # Policy: nessun default hardcoded.
+    # Se non passi esplicitamente i parametri, li risolvo dal CSV
+    # obbligatorio (o SystemExit in _load_filter_defaults_from_csv).
     # ------------------------------------------------------------
     resolved = resolve_regime_l1_params()
 
-    if adx_trend_enter is _AUTO: adx_trend_enter = float(resolved["adx_trend_enter"])
-    if adx_trend_exit  is _AUTO: adx_trend_exit  = float(resolved["adx_trend_exit"])
-    if adx_range_enter is _AUTO: adx_range_enter = float(resolved["adx_range_enter"])
-    if adx_range_exit  is _AUTO: adx_range_exit  = float(resolved["adx_range_exit"])
-    if atr_volatile_enter is _AUTO: atr_volatile_enter = float(resolved["atr_volatile_enter"])
-    if atr_volatile_exit  is _AUTO: atr_volatile_exit  = float(resolved["atr_volatile_exit"])
+    if adx_trend_enter is _AUTO:
+        adx_trend_enter = float(resolved["adx_trend_enter"])
+    if adx_trend_exit is _AUTO:
+        adx_trend_exit = float(resolved["adx_trend_exit"])
+    if adx_range_enter is _AUTO:
+        adx_range_enter = float(resolved["adx_range_enter"])
+    if adx_range_exit is _AUTO:
+        adx_range_exit = float(resolved["adx_range_exit"])
+    if atr_volatile_enter is _AUTO:
+        atr_volatile_enter = float(resolved["atr_volatile_enter"])
+    if atr_volatile_exit is _AUTO:
+        atr_volatile_exit = float(resolved["atr_volatile_exit"])
 
-    if confirm_bars_trend    is _AUTO: confirm_bars_trend    = int(resolved["confirm_bars_trend"])
-    if confirm_bars_range    is _AUTO: confirm_bars_range    = int(resolved["confirm_bars_range"])
-    if confirm_bars_volatile is _AUTO: confirm_bars_volatile = int(resolved["confirm_bars_volatile"])
+    # --- RANGE vs LATERAL (REGIME1) ---
+    if atr_range_enter is _AUTO:
+        atr_range_enter = float(resolved["atr_range_enter"])
+    if atr_range_exit is _AUTO:
+        atr_range_exit = float(resolved["atr_range_exit"])
+    if bb_width_range_enter is _AUTO:
+        bb_width_range_enter = float(resolved["bb_width_range_enter"])
+    if bb_width_range_exit is _AUTO:
+        bb_width_range_exit = float(resolved["bb_width_range_exit"])
+
+    # Bollinger (solo fallback)
+    if bb_period is _AUTO:
+        bb_period = int(resolved["bb_period"])
+    if bb_k is _AUTO:
+        bb_k = float(resolved["bb_k"])
+
+    if confirm_bars_trend is _AUTO:
+        confirm_bars_trend = int(resolved["confirm_bars_trend"])
+    if confirm_bars_range is _AUTO:
+        confirm_bars_range = int(resolved["confirm_bars_range"])
+    if confirm_bars_volatile is _AUTO:
+        confirm_bars_volatile = int(resolved["confirm_bars_volatile"])
 
     print(
         "[DEBUG][REGIME_L1] usando parametri:",
         f"adx_trend_enter={adx_trend_enter}, adx_trend_exit={adx_trend_exit}, "
         f"adx_range_enter={adx_range_enter}, adx_range_exit={adx_range_exit}, "
         f"atr_volatile_enter={atr_volatile_enter}, atr_volatile_exit={atr_volatile_exit}, "
+        f"atr_range_enter={atr_range_enter}, atr_range_exit={atr_range_exit}, "
+        f"bb_width_range_enter={bb_width_range_enter}, bb_width_range_exit={bb_width_range_exit}, "
+        f"bb_period={bb_period}, bb_k={bb_k}, "
         f"confirm_bars_trend={confirm_bars_trend}, confirm_bars_range={confirm_bars_range}, "
-        f"confirm_bars_volatile={confirm_bars_volatile}"
+        f"confirm_bars_volatile={confirm_bars_volatile}",
     )
 
-
-    required_cols = [
-        "close",
-        "KPI_EMA_21",
-        "KPI_EMA_50",
-        "KPI_EMA_200",
-        "KPI_ADX_14",
-        "KPI_ATR_PCT_14",
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
+    # ------------------------------------------------------------
+    # Required columns (base + KPI)
+    # ------------------------------------------------------------
+    required_base = ["close", "KPI_EMA_21", "KPI_EMA_50", "KPI_EMA_200", "KPI_ADX_14", "KPI_ATR_PCT_14"]
+    missing = [c for c in required_base if c not in df.columns]
     if missing:
         raise ValueError(f"[REGIME_L1] Colonne mancanti: {missing}")
 
     # --- segnali base -----------------------------------------------------
-    ema_up = (df["KPI_EMA_21"] > df["KPI_EMA_50"]) & (df["KPI_EMA_50"] > df["KPI_EMA_200"])
-    ema_dn = (df["KPI_EMA_21"] < df["KPI_EMA_50"]) & (df["KPI_EMA_50"] < df["KPI_EMA_200"])
+    ema21 = _to_float_series(df["KPI_EMA_21"])
+    ema50 = _to_float_series(df["KPI_EMA_50"])
+    ema200 = _to_float_series(df["KPI_EMA_200"])
 
-    adx = df["KPI_ADX_14"]
-    atrp = df["KPI_ATR_PCT_14"]
+    ema_up = (ema21 > ema50) & (ema50 > ema200)
+    ema_dn = (ema21 < ema50) & (ema50 < ema200)
 
-    # condizioni di ingresso/uscita (hysteresis)
+    # KPI regime
+    adx = _to_float_series(df["KPI_ADX_14"])
+    atrp = _to_float_series(df["KPI_ATR_PCT_14"])
+
+    # --- BB width % (REGIME1) -------------------------------------------
+    # Preferiamo una colonna già calcolata, se presente.
+    if "KPI_BB_WIDTH_PCT" in df.columns:
+        bb_width_pct = _to_float_series(df["KPI_BB_WIDTH_PCT"])
+    else:
+        # Calcolo BB width % da close:
+        # width_pct = (upper - lower) / mid * 100
+        close = _to_float_series(df["close"])
+        mid = close.rolling(bb_period, min_periods=bb_period).mean()
+        std = close.rolling(bb_period, min_periods=bb_period).std(ddof=0)
+        upper = mid + (bb_k * std)
+        lower = mid - (bb_k * std)
+        bb_width_pct = ((upper - lower) / mid) * 100.0
+
+    # --- condizioni ENTER/EXIT (hysteresis) ------------------------------
+    # TREND: ADX alto + EMA in ordine
     trend_up_enter = ema_up & (adx >= adx_trend_enter)
     trend_dn_enter = ema_dn & (adx >= adx_trend_enter)
-    trend_ok_exit = (adx >= adx_trend_exit)  # “trend ancora valido” lato ADX
+    trend_ok_exit = adx >= adx_trend_exit  # “trend ancora valido” lato ADX
 
-    volatile_enter = atrp >= atr_volatile_enter
-    volatile_ok_exit = atrp >= atr_volatile_exit
+    # VOLATILE: ATR_PCT alto MA non in trend forte (REGIME1)
+    volatile_enter = (atrp >= atr_volatile_enter) & (adx < adx_trend_enter)
+    volatile_ok_exit = (atrp >= atr_volatile_exit) & (adx < adx_trend_exit)
 
-    range_enter = adx < adx_range_enter
-    range_ok_exit = adx < adx_range_exit
+    # RANGE vs LATERAL (REGIME1)
+    # RANGE: ADX basso + ATR_PCT sufficiente + BB width sufficiente
+    range_enter = (adx < adx_range_enter) & (atrp >= atr_range_enter) & (bb_width_pct >= bb_width_range_enter)
+    range_ok_exit = (adx < adx_range_exit) & (atrp >= atr_range_exit) & (bb_width_pct >= bb_width_range_exit)
 
-    # --- RAW: classificazione istantanea (priorità) -----------------------
-    # Trend domina (se presente). Nota: up e down sono mutuamente esclusivi se EMA ordinate.
+    # LATERAL (REGIME1): ADX basso e non classificato come RANGE (fallback "calmo")
+    lateral_enter = (adx < adx_range_enter) & ~range_enter
+
+    # --- RAW: classificazione istantanea (priorità REGIME1) ---------------
+    # REGIME1: priorità = VOLATILE -> TREND -> RANGE -> LATERAL (fallback)
     raw = np.select(
-        [trend_up_enter, trend_dn_enter, volatile_enter, range_enter],
-        ["TREND_UP", "TREND_DOWN", "VOLATILE", "RANGE"],
+        [volatile_enter, trend_up_enter, trend_dn_enter, range_enter],
+        ["VOLATILE", "TREND_UP", "TREND_DOWN", "RANGE"],
         default="LATERAL",
     )
-    df[col_raw] = raw
-    df[col_reason] = df[col_raw]  # per ora reason = raw driver
+
+    df[col_raw] = pd.Series(raw, index=df.index).astype(str).str.strip().str.upper()
+    df[col_reason] = df[col_raw]  # reason = raw driver
+
+    # ------------------------------------------------------------
+    # REGIME1: fallback deterministico per eliminare UNKNOWN "non necessario"
+    # Tutto ciò che non è classificato e NON è in trend ADX alto -> LATERAL
+    # ------------------------------------------------------------
+    _raw = df[col_raw].astype(str).str.strip().str.upper()
+    m_unknown = _raw.eq("UNKNOWN") & (adx < adx_trend_enter)
+
+    df.loc[m_unknown, col_raw] = "LATERAL"
+    df.loc[m_unknown, col_reason] = "LATERAL_FALLBACK"
+
+    print("[DEBUG][REGIME1] fallback UNKNOWN->LATERAL rows =", int(m_unknown.sum()))
+
+    # ------------------------------------------------------------
+    # REGIME1: fallback deterministico per eliminare UNKNOWN "non necessario"
+    # Tutto ciò che non è classificato e NON è in trend ADX alto -> LATERAL
+    # ------------------------------------------------------------
+    _raw = df[col_raw].astype(str).str.strip().str.upper()
+    m_unknown = _raw.eq("UNKNOWN") & (adx < adx_trend_enter)
+
+    df.loc[m_unknown, col_raw] = "LATERAL"
+    df.loc[m_unknown, col_reason] = "LATERAL_FALLBACK"
+    print("[DEBUG][REGIME1] fallback UNKNOWN->LATERAL rows =", int(m_unknown.sum()))
 
     # --- Debounce helper: N barre consecutive True ------------------------
     def _confirm(sig: pd.Series, n: int) -> pd.Series:
@@ -357,19 +487,25 @@ def update_regime_state_Livello1(
     trend_dn_c = _confirm(trend_dn_enter, confirm_bars_trend)
     volatile_c = _confirm(volatile_enter, confirm_bars_volatile)
     range_c = _confirm(range_enter, confirm_bars_range)
+    # lateral non necessita debounce dedicato: è fallback “calmo”
 
     # --- State machine (sequenziale, deterministica) ----------------------
     # Stato iniziale: RAW della prima riga
-    states = []
-    prev = None
+    states: list[str] = []
+    prev: str | None = None
 
     for i in range(len(df)):
         if prev is None:
-            prev = df.iloc[i][col_raw]
+            prev0 = str(df.iloc[i][col_raw]).strip().upper()
+            # Se la prima riga è UNKNOWN ma non siamo in trend ADX alto, avvia come LATERAL
+            if prev0 == "UNKNOWN" and bool(adx.iat[i] < adx_trend_enter):
+                prev0 = "LATERAL"
+                df.at[df.index[i], col_reason] = "LATERAL_FALLBACK_INIT"
+            prev = prev0
             states.append(prev)
             continue
 
-        # Stato corrente e segnali “confermati”
+        # Segnali “confermati”
         su = bool(trend_up_c.iat[i])
         sd = bool(trend_dn_c.iat[i])
         sv = bool(volatile_c.iat[i])
@@ -392,18 +528,24 @@ def update_regime_state_Livello1(
                 states.append(prev)
                 continue
 
-        # Se non lo mantieni, prova transizioni in ordine di priorità
-        if su:
+        # Se non lo mantieni, prova transizioni in ordine di priorità REGIME1
+        if sv:
+            prev = "VOLATILE"
+        elif su:
             prev = "TREND_UP"
         elif sd:
             prev = "TREND_DOWN"
-        elif sv:
-            prev = "VOLATILE"
         elif sr:
             prev = "RANGE"
+
         else:
-            # fallback: RAW (ma senza jitter eccessivo grazie ai confirm sopra)
-            prev = df.iloc[i][col_raw]
+            # fallback: RAW (ma evita UNKNOWN quando ADX non è da trend)
+            prev_raw = str(df.iloc[i][col_raw]).strip().upper()
+            if prev_raw == "UNKNOWN" and bool(adx.iat[i] < adx_trend_enter):
+                prev = "LATERAL"
+                df.at[df.index[i], col_reason] = "LATERAL_FALLBACK_SM"
+            else:
+                prev = prev_raw
 
         states.append(prev)
 
@@ -412,17 +554,19 @@ def update_regime_state_Livello1(
     # --- SWITCH flag ------------------------------------------------------
     df[col_switch] = (df[col_out] != df[col_out].shift(1)).fillna(False).astype(int)
 
-    # --- CODE mapping (stabile) ------------------------------------------
+    # --- CODE mapping (REGIME1, stabile) ---------------------------------
     code_map = {
         "LATERAL": 0,
         "RANGE": 1,
         "VOLATILE": 2,
         "TREND_UP": 3,
         "TREND_DOWN": 4,
+        "UNKNOWN": 9,
     }
-    df[col_code] = df[col_out].map(code_map).fillna(0).astype(int)
+    df[col_code] = df[col_out].map(code_map).fillna(9).astype(int)
 
     return df
+
 
 
 def apply_regime_L1(
@@ -458,74 +602,31 @@ def apply_regime_L1(
     rf = (regime_filter or "OFF")
     rf = rf.strip().upper()
 
+    print("[DEBUG][REGIME_L1] apply_regime_L1 rf =", rf, "regime_filter=", regime_filter, "cfg_keys=",
+          list(cfg.keys()) if cfg else None)
+
     if rf == "OFF":
-        return df
+        # garantiamo colonne presenti per stabilità downstream
+        out = df.copy()
+        out["REGIME_L1_RAW"] = "UNKNOWN"
+        out["REGIME_L1"] = "UNKNOWN"
+        out["REGIME_L1_CODE"] = 9
+        out["REGIME_L1_SWITCH"] = 0
+        out["REGIME_L1_REASON"] = "UNKNOWN"
+        return out
 
-    if rf == "L1":
-        params = resolve_regime_l1_params(profile=profile, overrides=overrides)
+    if rf != "L1":
+        raise ValueError(f"[REGIME_L1] regime_filter non supportato: {regime_filter}")
 
-        # update_regime_state_Livello1 NON accetta lateral_label: rimuovilo se presente
-        params.pop("lateral_label", None)
-
-        return update_regime_state_Livello1(df, **params)
-
-    raise ValueError(f"Unknown regime_filter_L1: {regime_filter}")
+    out = df.copy()
+    out = update_regime_state_Livello1(out)
+    return out
 
 
-def apply_regime(df, cfg=None):
+def apply_regime(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     """
-    Bridge per PyKPI_calcolo: per default applica L1.
-    Se cfg specifica esplicitamente un filtro (OFF/L1) lo rispetta.
+    Bridge legacy: chiamata generica apply_regime(df, cfg) usata da loader/wizard.
     """
-    # Default coerente col commento: L1
-    default_filter = "L1"
-
-    # Se cfg contiene una scelta esplicita, usala; altrimenti resta L1
-    if cfg and isinstance(cfg, dict):
-        explicit = (
-            cfg.get("regime_filter")
-            or cfg.get("regime_filter_L1")
-            or cfg.get("filter")
-            or cfg.get("mode")
-        )
-        if explicit is not None:
-            default_filter = explicit
-
-    return apply_regime_L1(df, regime_filter=default_filter, cfg=cfg)
+    return apply_regime_L1(df, regime_filter="L1", cfg=cfg)
 
 
-
-def _regime_l1_preflight_qc() -> None:
-    b = globals().get("REGIME_L1_BASELINE", None)
-    if b is None:
-        raise RuntimeError("[REGIME_L1] REGIME_L1_BASELINE is not defined (load/config order issue).")
-
-
-    required_keys = (
-        "adx_trend_enter",
-        "adx_trend_exit",
-        "adx_range_enter",
-        "adx_range_exit",
-        "atr_volatile_enter",
-        "atr_volatile_exit",
-        "confirm_bars_trend",
-        "confirm_bars_range",
-        "confirm_bars_volatile",
-        "lateral_label",
-    )
-
-    missing = [k for k in required_keys if k not in b]
-    if missing:
-        raise RuntimeError(
-            f"[REGIME_L1] Missing keys in baseline config: {missing}"
-        )
-
-    if not isinstance(b["lateral_label"], str):
-        raise RuntimeError(
-            "[REGIME_L1] lateral_label must be a string"
-        )
-
-    if REGIME_L1_VERSION is None:
-        raise RuntimeError(
-            "[REGIME_L1] REGIME_L1_VERSION must be explicitly set"
-        )

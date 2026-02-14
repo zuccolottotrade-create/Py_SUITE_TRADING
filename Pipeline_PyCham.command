@@ -21,6 +21,8 @@ tty_sane
 # - Mantiene moduli pipeline interattivi (PIPELINE_MODE=0)
 # - Strategy Creator usa la venv del repo strategy_creator e produce log per ogni run
 # ============================================================
+# NOTE OPERATIVE:
+# - CTRL+C interrompe il modulo in esecuzione e riporta SEMPRE al menu principale
 
 # ============================================================
 # ROOT DETECTION ROBUSTA
@@ -180,9 +182,11 @@ run_controllo_coerenza() {
 }
 
 run_pykpi_calcolo() {
+  # PyKPI_calcolo deve SEMPRE essere interattivo quando lanciato singolarmente
   run_cmd_file "A3 - PyKPI_calcolo" \
-    "$PY_SUITE_ROOT/2. PyKPI_calcolo/PyKPI_calcolo.command"
+    "$PY_SUITE_ROOT/2. PyKPI_calcolo/PyKPI_calcolo.command" 0
 }
+
 
 run_strategia() {
   run_cmd_file "A4 - Run_strategia" \
@@ -298,6 +302,9 @@ menu() {
     say ""
     say "  0) Esci"
     say "--------------------------------------------------------------------"
+
+
+
     read -r "CHOICE?Seleziona un'opzione: " <&3
 
     case "$CHOICE" in
