@@ -1,12 +1,16 @@
 [submodule "2. PyKPI_calcolo"]
 	path = 2. PyKPI_calcolo
 	url = git@github.com:zuccolottotrade-create/PyKPI_calcolo.git
+	branch = main
 [submodule "3. Run_strategia"]
 	path = 3. Run_strategia
 	url = git@github.com:zuccolottotrade-create/Run_strategia.git
+	branch = main
 [submodule "4. REPORT strategia"]
 	path = 4. REPORT strategia
 	url = git@github.com:zuccolottotrade-create/REPORT_strategia.git
+	branch = main
 [submodule "1. estrazione_pro"]
 	path = 1. estrazione_pro
 	url = git@github.com:zuccolottotrade-create/estrazione_pro.git
+	branch = main
