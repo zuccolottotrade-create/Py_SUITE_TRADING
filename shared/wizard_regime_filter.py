@@ -739,13 +739,55 @@ def main() -> int:
     # ------------------------------------------------------------
     # DEBUG KPI reali (NaN% + min/max) per capire UNKNOWN=100%
     # ------------------------------------------------------------
+
+    def _to_float_mixed(series: pd.Series) -> pd.Series:
+        s = series.astype(str).str.strip()
+
+        # normalizza vuoti / nan string
+        s = s.replace({"": None, "None": None, "nan": None, "NaN": None})
+
+        # se contiene sia '.' che ',' assumiamo che l'ultimo simbolo sia il separatore decimale
+        # - EU: 1.234,56  -> decimale ','  -> rimuovo '.' e cambio ','->'.'
+        # - US: 1,234.56  -> decimale '.'  -> rimuovo ',' (migliaia)
+        has_dot = s.str.contains(r"\.", na=False)
+        has_comma = s.str.contains(r",", na=False)
+        both = has_dot & has_comma
+
+        s_both = s.where(both)
+
+        # posizione dell'ultimo '.' e dell'ultima ','
+        last_dot = s_both.str.rfind(".")
+        last_comma = s_both.str.rfind(",")
+
+        eu_mask = both & (last_comma > last_dot)  # es: 1.234,56
+        us_mask = both & (last_dot > last_comma)  # es: 1,234.56
+
+        # EU case
+        s = s.mask(eu_mask, s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+        # US case
+        s = s.mask(us_mask, s.str.replace(",", "", regex=False))
+
+        # solo virgola -> decimale EU
+        only_comma = has_comma & ~has_dot
+        s = s.mask(only_comma, s.str.replace(",", ".", regex=False))
+
+        # solo punto -> già ok (decimale US) -> non toccare
+
+        return pd.to_numeric(s, errors="coerce")
+
+
     kpi_check = ["KPI_ADX_14", "KPI_ATR_PCT_14", "KPI_EMA_21", "KPI_EMA_50", "KPI_EMA_200"]
     for c in kpi_check:
         if c in df2.columns:
             s = df2[c]
             # prova conversione EU->float per diagnostica
-            s_num = pd.to_numeric(s.astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
-                                  errors="coerce")
+            s_num = _to_float_mixed(s)
+
+            raw_sample = s.dropna().astype(str).head(3).tolist()
+            num_sample = s_num.dropna().head(3).tolist()
+            print(f"[DBG][KPI][SAMPLE] {c}: raw={raw_sample} -> num={num_sample}")
+
+
             print(f"[DBG][KPI] {c}: NaN%={s_num.isna().mean() * 100:.2f}  min={s_num.min()}  max={s_num.max()}")
         else:
             print(f"[DBG][KPI] {c}: MISSING")
@@ -769,23 +811,126 @@ def main() -> int:
         # KPI regime (nomi reali in suite)
         "KPI_ADX_14",
         "KPI_ATR_PCT_14",
-
-        # BB width: varianti possibili
+    ]
+    bb_candidates = [
+        "KPI_BB_WIDTH_PCT",  # usato dal classifier se presente
+        "KPI_BB_WIDTH_20_2p0",  # tuo standard KPILIST
         "KPI_BB_WIDTH_20",
-        "KPI_BB_WIDTH_PCT",
         "KPI_BB_WIDTH",
         "BB_WIDTH",
     ]
+    all_candidates = candidates + bb_candidates
 
-    present = [c for c in candidates if c in df2.columns]
-    missing = [c for c in candidates if c not in df2.columns]
+    present = [c for c in all_candidates if c in df2.columns]
+    missing_all = [c for c in all_candidates if c not in df2.columns]
+
+    # separa missing BB da missing "veri"
+    bb_missing = [c for c in bb_candidates if c not in df2.columns]
+    missing_non_bb = [c for c in missing_all if c not in bb_candidates]
+
+    bb_optional = []
+    if bb_missing and ("close" in df2.columns):
+        # Se abbiamo close, il classifier può calcolare BB width pct in fallback
+        bb_optional = bb_missing
+        bb_missing = []
+
+    missing_final = missing_non_bb + bb_missing
 
     print(f"[DBG][REGIME] KPI candidates present: {present}")
-    print(f"[DBG][REGIME] KPI candidates missing: {missing}")
-
+    print(f"[DBG][REGIME] KPI candidates missing: {missing_final}")
+    if bb_optional:
+        print(f"[DBG][REGIME] BB width optional (computed from close): {bb_optional}")
     for c in present:
         na_rate = float(df2[c].isna().mean() * 100.0)
         print(f"[DBG][REGIME] {c} NaN% = {na_rate:.2f}")
+
+    # ------------------------------------------------------------
+    # EXTRA DEBUG REGIME1 (1H): tassi condizioni + quantili
+    # Coerente con regime_classifier_1.py:
+    # - VOLATILE: atrp >= atr_volatile_enter AND adx < adx_trend_enter
+    # - TREND   : adx >= adx_trend_enter (+ EMA alignment)
+    # - RANGE   : adx < adx_range_enter AND atrp >= atr_range_enter AND bb_width_pct >= bb_width_range_enter
+    # BB width pct: usa KPI_BB_WIDTH_PCT se presente, altrimenti calcola da close (bb_period/bb_k)
+    # ------------------------------------------------------------
+    def _num(col: str) -> pd.Series:
+        if col not in df2.columns:
+            return pd.Series([np.nan] * len(df2), index=df2.index)
+        return pd.to_numeric(df2[col], errors="coerce")
+
+    def _fmt_eu(x: float, nd: int = 6) -> str:
+        try:
+            return f"{float(x):.{nd}f}".replace(".", ",")
+        except Exception:
+            return "nan"
+
+    # serie base
+    adx = _num("KPI_ADX_14")
+    atrp = _num("KPI_ATR_PCT_14")
+
+    # parametri (prendo quelli del CSV override se disponibili nel contesto, altrimenti fallback)
+    # NOTA: qui uso i default già noti dal tuo log; se nel wizard hai un dict cfg/overrides, sostituisci sotto.
+    try:
+        adx_trend_enter_v = float(adx_trend_enter)
+        adx_range_enter_v = float(adx_range_enter)
+        atr_volatile_enter_v = float(atr_volatile_enter)
+        atr_range_enter_v = float(atr_range_enter)
+        bb_width_range_enter_v = float(bb_width_range_enter)
+        bb_period_v = int(bb_period)
+        bb_k_v = float(bb_k)
+    except Exception:
+        # fallback hard (coerente coi tuoi override attuali)
+        adx_trend_enter_v = 30.0
+        adx_range_enter_v = 35.0
+        atr_volatile_enter_v = 0.21
+        atr_range_enter_v = 0.13
+        bb_width_range_enter_v = 0.35
+        bb_period_v = 20
+        bb_k_v = 2.0
+
+    # BB width pct coerente col classifier
+    if "KPI_BB_WIDTH_PCT" in df2.columns:
+        bb_width_pct = _num("KPI_BB_WIDTH_PCT")
+        bb_src = "KPI_BB_WIDTH_PCT"
+    else:
+        close = _num("close")
+        mid = close.rolling(bb_period_v, min_periods=bb_period_v).mean()
+        std = close.rolling(bb_period_v, min_periods=bb_period_v).std(ddof=0)
+        upper = mid + (bb_k_v * std)
+        lower = mid - (bb_k_v * std)
+        bb_width_pct = ((upper - lower) / mid) * 100.0
+        bb_src = f"close->BB_WIDTH_PCT(p={bb_period_v},k={bb_k_v})"
+
+    # tassi condizioni (solo su righe dove KPI sono disponibili)
+    valid = adx.notna() & atrp.notna() & bb_width_pct.notna()
+    n_valid = int(valid.sum())
+    if n_valid > 0:
+        m_vol = valid & (atrp >= atr_volatile_enter_v) & (adx < adx_trend_enter_v)
+        m_trend = valid & (adx >= adx_trend_enter_v)
+        m_range = valid & (adx < adx_range_enter_v) & (atrp >= atr_range_enter_v) & (bb_width_pct >= bb_width_range_enter_v)
+
+        print("\n[DBG][REGIME1][RATES] (su righe valide KPI: n=%d)  bb_src=%s" % (n_valid, bb_src))
+        print("[DBG][REGIME1][RATES] P(ATR_PCT>=atr_volatile_enter & ADX<adx_trend_enter) = %.2f%%" % (m_vol.sum() / n_valid * 100.0))
+        print("[DBG][REGIME1][RATES] P(ADX>=adx_trend_enter) = %.2f%%" % (m_trend.sum() / n_valid * 100.0))
+        print("[DBG][REGIME1][RATES] P(RANGE core: ADX<adx_range_enter & ATR_PCT>=atr_range_enter & BBW>=bbw_enter) = %.2f%%" % (m_range.sum() / n_valid * 100.0))
+
+        # quantili utili (min / p50 / p75 / max) per calibrare soglie
+        def _q(s: pd.Series):
+            s2 = s[valid].astype(float)
+            return float(s2.min()), float(s2.quantile(0.50)), float(s2.quantile(0.75)), float(s2.max())
+
+        adx_min, adx_p50, adx_p75, adx_max = _q(adx)
+        atr_min, atr_p50, atr_p75, atr_max = _q(atrp)
+        bbw_min, bbw_p50, bbw_p75, bbw_max = _q(bb_width_pct)
+
+        print("[DBG][REGIME1][Q] ADX_14      min=%s p50=%s p75=%s max=%s" % (_fmt_eu(adx_min,4), _fmt_eu(adx_p50,4), _fmt_eu(adx_p75,4), _fmt_eu(adx_max,4)))
+        print("[DBG][REGIME1][Q] ATR_PCT_14  min=%s p50=%s p75=%s max=%s" % (_fmt_eu(atr_min,6), _fmt_eu(atr_p50,6), _fmt_eu(atr_p75,6), _fmt_eu(atr_max,6)))
+        print("[DBG][REGIME1][Q] BBW_PCT     min=%s p50=%s p75=%s max=%s  (src=%s)" % (_fmt_eu(bbw_min,6), _fmt_eu(bbw_p50,6), _fmt_eu(bbw_p75,6), _fmt_eu(bbw_max,6), bb_src))
+    else:
+        print("\n[DBG][REGIME1][RATES] n_valid=0 (KPI insufficient: ADX/ATR/BBW)")
+
+
+
+
 
     # STEP 6: genera report
     build_regime_report, write_single_csv_report = _import_report_tools(suite_root)
@@ -845,10 +990,44 @@ def main() -> int:
     # ------------------------------------------------------------
     coverage_pct = _extract_regime_coverage_pct_from_sheets(sheets, regime_col="REGIME_L1")
 
+
+
+
+    def _infer_timeframe_label_from_filename(path_str: str) -> str:
+        s = (path_str or "").lower()
+        if "_30min_" in s or "_30m_" in s or "30min" in s:
+            return "30m"
+        if "_1hour_" in s or "_1h_" in s or "1hour" in s:
+            return "1h"
+        if "_1day_" in s or "_1d_" in s or "1day" in s:
+            return "1d"
+        if "_1week_" in s or "_1w_" in s or "1week" in s:
+            return "1w"
+        return "unknown"
+
+    # timeframe label coerente con il file input selezionato
+    # (usa la variabile path già disponibile nel tuo blocco; se è una Path, va bene str(path))
+
+    # target set per timeframe (se non esistono i target dedicati, fallback a 30m)
+    timeframe_label = _infer_timeframe_label_from_filename(str(in_file))
+
+    _targets_by_tf = {
+        "30m": REGIME_L1_TARGETS_30M,
+        "1h": globals().get("REGIME_L1_TARGETS_1H"),
+        "1d": globals().get("REGIME_L1_TARGETS_1D"),
+        "1w": globals().get("REGIME_L1_TARGETS_1W"),
+    }
+
+    targets = _targets_by_tf.get(timeframe_label) or REGIME_L1_TARGETS_30M
+
+    if timeframe_label != "30m" and targets is REGIME_L1_TARGETS_30M:
+        print(
+            f"[REGIME][WARN] Target band specifici per timeframe '{timeframe_label}' non trovati: uso REGIME_L1_TARGETS_30M (fallback).")
+
     print_regime_coverage_table_vs_target(
         coverage_pct,
-        targets=REGIME_L1_TARGETS_30M,
-        timeframe_label="30m",
+        targets=targets,
+        timeframe_label=timeframe_label,
     )
     # ------------------------------------------------------------
     # WIZARD OUTPUT: Validazione statistica (Kruskal/Chi2 ecc.)
