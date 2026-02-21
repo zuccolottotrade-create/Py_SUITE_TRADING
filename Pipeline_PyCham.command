@@ -1,4 +1,7 @@
 #!/bin/zsh
+# --- FORCE python3.13 (Framework) ---
+export PATH="/Library/Frameworks/Python.framework/Versions/3.13/bin:$PATH"
+hash -r
 set -euo pipefail
 
 # I/O sempre su TTY (robusto contro moduli che rompono stdin)
@@ -252,7 +255,8 @@ run_build_config() {
 
 run_wizard_regime_filter() {
   run_strategy_step "B4 - Regime Filter Wizard (apply + report)" \
-    python3 "$PY_SUITE_ROOT/shared/wizard_regime_filter.py"
+    /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+    "$PY_SUITE_ROOT/shared/wizard_regime_filter.py"
 
 
 }

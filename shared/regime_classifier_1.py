@@ -466,16 +466,6 @@ def update_regime_state_Livello1(
 
     print("[DEBUG][REGIME1] fallback UNKNOWN->LATERAL rows =", int(m_unknown.sum()))
 
-    # ------------------------------------------------------------
-    # REGIME1: fallback deterministico per eliminare UNKNOWN "non necessario"
-    # Tutto ciò che non è classificato e NON è in trend ADX alto -> LATERAL
-    # ------------------------------------------------------------
-    _raw = df[col_raw].astype(str).str.strip().str.upper()
-    m_unknown = _raw.eq("UNKNOWN") & (adx < adx_trend_enter)
-
-    df.loc[m_unknown, col_raw] = "LATERAL"
-    df.loc[m_unknown, col_reason] = "LATERAL_FALLBACK"
-    print("[DEBUG][REGIME1] fallback UNKNOWN->LATERAL rows =", int(m_unknown.sum()))
 
     # --- Debounce helper: N barre consecutive True ------------------------
     def _confirm(sig: pd.Series, n: int) -> pd.Series:
