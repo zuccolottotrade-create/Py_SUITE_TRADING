@@ -7,3 +7,6 @@
 [submodule "4. REPORT strategia"]
 	path = 4. REPORT strategia
 	url = git@github.com:zuccolottotrade-create/REPORT_strategia.git
+[submodule "1. estrazione_pro"]
+	path = 1. estrazione_pro
+	url = git@github.com:zuccolottotrade-create/estrazione_pro.git
