@@ -80,3 +80,7 @@ Pipeline Launcher/*copia*.command
 
 # backup command files
 *.BAK*.command
+
+# local
+IB_order_delivery/
+docs/*.pdf
