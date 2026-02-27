@@ -84,3 +84,23 @@ Pipeline Launcher/*copia*.command
 # local
 IB_order_delivery/
 docs/*.pdf
+
+# macOS
+.DS_Store
+
+# python
+__pycache__/
+*.py[cod]
+
+# docs local artifacts
+/docs/*.xlsx
+
+# macOS
+.DS_Store
+
+# python
+__pycache__/
+*.py[cod]
+
+# docs local artifacts
+/docs/*.xlsx

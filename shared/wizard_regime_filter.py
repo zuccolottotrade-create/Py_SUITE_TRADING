@@ -7,6 +7,10 @@ import pandas as pd
 import numpy as np
 
 import scipy
+from shared.regime_auto_calibration.regime_objectives import OBJECTIVES
+
+
+
 
 print("\n[DEBUG INTERPRETER]")
 print("sys.executable:", sys.executable)
@@ -15,6 +19,36 @@ print("scipy.__file__:", scipy.__file__)
 print("scipy.__version__:", scipy.__version__)
 print()
 
+
+
+# ------------------------------------------------------------
+# Formatter numerico standard (EU comma decimale)
+# ------------------------------------------------------------
+def _fmt(v):
+    if v is None:
+        return "None"
+    try:
+        if isinstance(v, float):
+            return f"{v:.6f}".replace(".", ",")
+        return str(v)
+    except Exception:
+        return str(v)
+
+
+# ------------------------------------------------------------
+# ANSI COLORS (terminal output)
+# ------------------------------------------------------------
+class _C:
+    RESET  = "\033[0m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN   = "\033[36m"
+    BOLD   = "\033[1m"
+
+
+def _color(text, color):
+    return f"{color}{text}{_C.RESET}"
 
 
 # --- bootstrap: garantisce import da Py_SUITE_TRADING root ---
@@ -94,6 +128,331 @@ def _fmt_spread(v: float) -> str:
     else:
         return _bad(f"{v:.6f}")
 
+def print_regime_validation_report(
+    stats_sheet: pd.DataFrame,
+    *,
+    coverage_table: "pd.DataFrame | list[dict] | None" = None,
+    title: str = "REGIME VALIDATION REPORT",
+) -> dict:
+    """Stampa *tutto* il report di validazione regime in UNICA funzione.
+
+    Requisito progetto: la stampa del report deve essere centralizzata e richiamabile dall'esterno.
+    Ritorna un dict con metriche/verdettto (utile per test/automation).
+    """
+
+    def _to_float(x, default=None):
+        try:
+            if x is None:
+                return default
+            s = str(x).strip()
+            if s in ("", "nan", "None", "NaN"):
+                return default
+            # EU decimal -> float
+            if s.startswith("<"):
+                return 0.0
+            return float(s.replace(",", "."))
+        except Exception:
+            return default
+
+    def _get_metric(name: str):
+        row = stats_sheet[stats_sheet["metric"] == name]
+        if row.empty:
+            return None
+        return row["value"].iloc[0]
+
+    # --- Normalizza coverage_table in DataFrame (se lista di dict)
+    cov_df = None
+    if coverage_table is not None:
+        if hasattr(coverage_table, "columns"):
+            cov_df = coverage_table  # type: ignore[assignment]
+        elif isinstance(coverage_table, list):
+            try:
+                cov_df = pd.DataFrame(coverage_table)
+            except Exception:
+                cov_df = None
+
+    # ------------------------------------------------------------
+    # 1) Informatività (Kruskal/Cliff/Spread)
+    # ------------------------------------------------------------
+    kr_p = _to_float(_get_metric("kruskal_r5_pvalue"), default=None)
+    kr_good = (kr_p is not None) and (kr_p < 0.05)
+
+    cliff_vals = stats_sheet[
+        stats_sheet["metric"].str.contains("cliff_r5_vs_best", na=False)
+    ]["value"].tolist()
+    cliff_vals = [_to_float(v, default=None) for v in cliff_vals]
+    cliff_vals = [v for v in cliff_vals if v is not None]
+    max_cliff = max([abs(v) for v in cliff_vals], default=0.0)
+
+    r5_means = stats_sheet[
+        stats_sheet["metric"].str.endswith(".r5_mean", na=False)
+    ]["value"].tolist()
+    r5_means = [_to_float(v, default=None) for v in r5_means]
+    r5_means = [v for v in r5_means if v is not None]
+    spread = (max(r5_means) - min(r5_means)) if len(r5_means) >= 2 else 0.0
+
+    TH_CLIFF_GOOD = 0.15
+    TH_SPREAD_GOOD = 0.0020
+    effect_good = (max_cliff >= TH_CLIFF_GOOD)
+    spread_good = (spread >= TH_SPREAD_GOOD)
+    info_good = bool(kr_good and (effect_good or spread_good))
+
+    # ------------------------------------------------------------
+    # 2) Coverage vs Target (Chi²) + delta-to-band (se disponibile)
+    # ------------------------------------------------------------
+    chi2_p_cov = _to_float(_get_metric("chi2_pvalue"), default=None)
+    coverage_off_target = (chi2_p_cov is not None) and (chi2_p_cov < 0.05)
+
+    TARGET_KEYS = ["TREND", "RANGE", "LATERAL", "VOLATILE", "UNKNOWN"]
+
+    def _extract_coverage_from_table(df_cov):
+        # formato atteso: REGIME, STATUS, DELTA to band
+        if df_cov is None or getattr(df_cov, "empty", True):
+            return 0, 0.0, 0.0, []
+
+        cols = {str(c).strip(): c for c in df_cov.columns}
+        col_reg = cols.get("REGIME") or cols.get("regime")
+        col_status = cols.get("STATUS") or cols.get("status")
+        col_delta = (
+            cols.get("DELTA to band")
+            or cols.get("DELTA_TO_BAND")
+            or cols.get("delta_to_band")
+        )
+        if not (col_reg and col_status and col_delta):
+            return 0, 0.0, 0.0, []
+
+        df = df_cov.copy()
+        df[col_reg] = df[col_reg].astype(str).str.strip()
+        df[col_status] = df[col_status].astype(str).str.strip().str.upper()
+        df = df[df[col_reg].isin(TARGET_KEYS)]
+        if df.empty:
+            return 0, 0.0, 0.0, []
+
+        deltas = []
+        out_list = []
+        for _, r in df.iterrows():
+            st = str(r[col_status]).upper()
+            d = _to_float(r[col_delta], default=0.0) or 0.0
+            if st == "IN":
+                d = 0.0
+            elif st == "OUT":
+                d = abs(d)
+                out_list.append((r[col_reg], d))
+            else:
+                d = 0.0
+            deltas.append(d)
+
+        n_out = len(out_list)
+        max_delta = max(deltas) if deltas else 0.0
+        sum_delta = sum(deltas) if deltas else 0.0
+        return n_out, max_delta, sum_delta, out_list
+
+    def _extract_coverage_from_stats():
+        # fallback: metriche coverage.<REGIME>.status / delta_to_band
+        deltas = []
+        out_list = []
+        for reg in TARGET_KEYS:
+            st = _get_metric(f"coverage.{reg}.status")
+            st = str(st).strip().upper() if st is not None else None
+            d = _to_float(_get_metric(f"coverage.{reg}.delta_to_band"), default=0.0) or 0.0
+            if st == "IN":
+                d = 0.0
+            elif st == "OUT":
+                d = abs(d)
+                out_list.append((reg, d))
+            else:
+                d = 0.0
+            deltas.append(d)
+
+        n_out = len(out_list)
+        max_delta = max(deltas) if deltas else 0.0
+        sum_delta = sum(deltas) if deltas else 0.0
+        return n_out, max_delta, sum_delta, out_list
+
+    n_out, max_delta, sum_delta, out_list = _extract_coverage_from_table(cov_df)
+    if n_out == 0 and max_delta == 0.0 and sum_delta == 0.0 and not out_list:
+        n_out, max_delta, sum_delta, out_list = _extract_coverage_from_stats()
+
+    unknown_obs = _to_float(_get_metric("coverage.UNKNOWN.observed_pct"), default=None)
+    unknown_ok = True if unknown_obs is None else (unknown_obs <= 0.5)  # tolleranza micro 0,5%
+
+    # ------------------------------------------------------------
+    # 3) Regole A/B/C (calibrazione)
+    # ------------------------------------------------------------
+    TH_MAX_DELTA_B = 10.0
+    TH_SUM_DELTA_B = 15.0
+    TH_SUM_DELTA_C = 20.0
+    TH_N_OUT_C = 3
+
+    chi2_bad = coverage_off_target
+
+    is_A = (n_out == 0) and (not chi2_bad) and (unknown_ok is True)
+    is_B1 = (n_out >= 1) and (max_delta <= TH_MAX_DELTA_B) and (sum_delta <= TH_SUM_DELTA_B) and info_good
+    is_B2 = (chi2_bad is True) and (max_delta <= TH_MAX_DELTA_B) and (n_out <= 2)
+    is_B = (not is_A) and (is_B1 or is_B2)
+    is_C1 = (max_delta > TH_MAX_DELTA_B) or (sum_delta > TH_SUM_DELTA_C) or (n_out >= TH_N_OUT_C)
+    is_C2 = (unknown_ok is False)
+    is_C3 = (info_good is False)
+    is_C = (not is_A) and (not is_B) and (is_C1 or is_C2 or is_C3)
+
+    if is_A:
+        verdict = "A"
+        verdict_msg = "✅ CALIBRAZIONE NON NECESSARIA"
+    elif is_C:
+        verdict = "C"
+        verdict_msg = "⚠ CALIBRAZIONE ASSOLUTAMENTE NECESSARIA"
+    else:
+        verdict = "B"
+        verdict_msg = "ℹ️ CALIBRAZIONE RACCOMANDATA"
+
+    # ------------------------------------------------------------
+    # 4) STAMPA REPORT (UNICA) — include: Auto A/B/C + verdict narrativo + summary/ranking
+    # ------------------------------------------------------------
+    print("\n" + _info(f"===== {title} ====="))
+
+    # Auto verdict (A/B/C)
+    # colore in base al livello (solo se TTY)
+    if verdict == "A":
+        head = _ok(verdict_msg)
+    elif verdict == "B":
+        head = _warn(verdict_msg)
+    else:
+        head = _bad(verdict_msg)
+
+    print(head + _muted(f"  (level={verdict})"))
+
+    reasons = []
+
+    # label colorate (usa le funzioni già presenti: _ok/_warn/_bad)
+    chi2_tag = _bad("BAD") if chi2_bad else _ok("OK")
+    kr_tag = _ok("OK") if kr_good else _warn("NO")
+    effect_tag = _ok("OK") if effect_good else _warn("NO")
+    spread_tag = _ok("OK") if spread_good else _warn("NO")
+    unk_tag = _bad("BAD") if (unknown_ok is False) else _ok("OK")
+
+    if n_out > 0:
+        out_str = ", ".join([f"{r} Δ={_fmt(d)}" for r, d in out_list]) if out_list else f"n_out={n_out}"
+        reasons.append(f"coverage_out: {out_str} | maxΔ={_fmt(max_delta)} | sumΔ={_fmt(sum_delta)}")
+
+    if chi2_p_cov is not None:
+        reasons.append(f"chi2_pvalue_coverage={_fmt(chi2_p_cov)} ({_bad('BAD') if chi2_bad else _ok('OK')})")
+    if kr_p is not None:
+        reasons.append(f"kruskal_r5_pvalue={_fmt(kr_p)} ({_ok('OK') if kr_good else _warn('NO')})")
+    reasons.append(f"max|cliff_r5|={_fmt(max_cliff)} ({_ok('OK') if effect_good else _warn('NO')})")
+    reasons.append(f"spread_r5_mean={_fmt(spread)} ({_ok('OK') if spread_good else _warn('NO')})")
+    if unknown_obs is not None:
+        reasons.append(f"UNKNOWN_observed%={_fmt(unknown_obs)} ({_ok('OK') if unknown_ok else _bad('BAD')})")
+
+    # Verdict narrativo (informatività + coverage)
+    print("\n" + _info("-- Verdict (interpretazione) --"))
+    if kr_p is not None and kr_p < 0.05 and max_cliff >= 0.147 and spread > 0.001:
+        if coverage_off_target:
+            print(_warn("⚠ Regimi informativi ma coverage fuori target (Chi²)"))
+            print(_muted("  (Differenziazione statistica OK, ma calibrazione distribuzione consigliata)"))
+        else:
+            print(_ok("✔ Regimi differenziati in modo robusto"))
+            print(_muted("  (Significatività statistica + effect size medio/grande + spread economico)"))
+    elif max_cliff >= 0.10 and spread > 0.0005:
+        print(_warn("⚠ Differenze moderate (possibile segnale, da monitorare)"))
+    else:
+        print(_bad("✖ Nessuna evidenza solida di differenziazione tra regimi"))
+
+    print(_info("  kruskal_pvalue_r5: ") + _fmt_pvalue(kr_p))
+    print(_info("  max|cliff_r5|: ") + _fmt_cliff(max_cliff))
+    print(_info("  spread r5_mean: ") + _fmt_spread(spread))
+    if coverage_off_target:
+        p_txt = "< 1e-6" if (chi2_p_cov is not None and chi2_p_cov < 1e-6) else _fmt(chi2_p_cov)
+        print(_info("  chi2_pvalue_coverage: ") + _warn(p_txt))
+
+    # Summary by regime (PRO) + ranking
+    print("\n" + _info("-- Summary by Regime (PRO) --"))
+    print(_muted("(Statistiche forward return r1/r5 per regime."))
+    print(_muted(" r*_hit = probabilità di rendimento positivo."))
+    print(_muted(" cliff5 = effect size vs miglior regime (range [-1,+1]).)"))
+
+    regime_metrics = stats_sheet[stats_sheet["metric"].str.contains(r"\.")]
+    regimes = sorted(set(str(m).split(".")[0] for m in regime_metrics["metric"]))
+
+    def _get(reg, suffix):
+        row = stats_sheet[stats_sheet["metric"] == f"{reg}.{suffix}"]
+        if row.empty:
+            return ""
+        return _fmt(row["value"].iloc[0])
+
+    cols = [
+        ("N", "n", 6),
+        ("r1_mean", "r1_mean", 12),
+        ("r1_med", "r1_median", 10),
+        ("r1_std", "r1_std", 10),
+        ("r1_hit", "r1_hit_rate", 9),
+        ("r5_mean", "r5_mean", 12),
+        ("r5_med", "r5_median", 10),
+        ("r5_std", "r5_std", 10),
+        ("r5_hit", "r5_hit_rate", 9),
+        ("cliff5", "cliff_r5_vs_best", 9),
+    ]
+
+    header = f"{'REGIME':12s} | " + " | ".join([f"{c[0]:>{c[2]}s}" for c in cols])
+    print(_info(header))
+    print(_muted("-" * len(header)))
+
+    ranking = []
+    for reg in regimes:
+        r5m = stats_sheet[stats_sheet["metric"] == f"{reg}.r5_mean"]["value"]
+        r5m = _to_float(r5m.iloc[0], default=np.nan) if (not r5m.empty) else np.nan
+        ranking.append((reg, r5m))
+
+    ranking_clean = [(r, v) for r, v in ranking if v == v]
+    best_reg = max(ranking_clean, key=lambda x: x[1])[0] if ranking_clean else None
+    worst_reg = min(ranking_clean, key=lambda x: x[1])[0] if ranking_clean else None
+
+    for reg in regimes:
+        reg_u = str(reg).strip().upper()
+        tag = ""
+        color_fn = None
+
+        if best_reg and reg == best_reg:
+            tag = " ★"
+            color_fn = _ok
+        elif worst_reg and reg == worst_reg:
+            tag = " ⚠"
+            color_fn = _bad
+        elif reg_u == "VOLATILE":
+            tag = " ⚠"
+            color_fn = _warn
+
+        line = f"{(str(reg) + tag):12s} | " + " | ".join([f"{_get(reg, c[1]):>{c[2]}s}" for c in cols])
+        print(color_fn(line) if color_fn else line)
+
+    if ranking_clean:
+        ranking_sorted = sorted(ranking_clean, key=lambda x: x[1], reverse=True)
+
+        def _print_rank(title, items):
+            print(f"\n-- {title} --")
+            print(f"{'REGIME':12s} | {'r5_mean':>12s}")
+            print("-" * 28)
+            for r, v in items:
+                print(f"{r:12s} | {_fmt(v):>12s}")
+
+        top_n = min(5, len(ranking_sorted))
+        bot_n = min(5, len(ranking_sorted))
+        _print_rank("Top", ranking_sorted[:top_n])
+        if bot_n > 0:
+            _print_rank("Bottom", list(reversed(ranking_sorted[-bot_n:])))
+
+    return {
+        "verdict": verdict,
+        "verdict_msg": verdict_msg,
+        "chi2_pvalue_coverage": chi2_p_cov,
+        "kruskal_r5_pvalue": kr_p,
+        "max_cliff_r5": max_cliff,
+        "spread_r5_mean": spread,
+        "n_out": n_out,
+        "max_delta": max_delta,
+        "sum_delta": sum_delta,
+        "unknown_observed_pct": unknown_obs,
+    }
+
 def _isatty() -> bool:
     try:
         import sys
@@ -107,26 +466,56 @@ def _c(txt: str, code: str) -> str:
         return txt
     return f"\x1b[{code}m{txt}\x1b[0m"
 
+# ------------------------------------------------------------
+# ANSI color helpers (terminal/log)
+# ------------------------------------------------------------
+import os
+import sys
 
-def _ok(txt: str) -> str:
-    return _c(txt, "1;32")  # bold green
+def _use_color() -> bool:
+    """
+    Decide se usare ANSI colors.
+    - Se FORCE_COLOR=1 -> SEMPRE
+    - Se NO_COLOR=1 -> MAI
+    - Se stdout è TTY -> SI
+    - Fallback macOS: TERM != dumb -> SI (utile per .command / launcher log)
+    """
+    if os.environ.get("NO_COLOR", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+        return False
+    if os.environ.get("FORCE_COLOR", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+        return True
 
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if is_tty:
+        return True
 
-def _warn(txt: str) -> str:
-    return _c(txt, "1;33")  # bold yellow
+    term = os.environ.get("TERM", "").strip().lower()
+    if term and term != "dumb":
+        return True
 
+    return False
 
-def _bad(txt: str) -> str:
-    return _c(txt, "1;31")  # bold red
+_USE_COLOR = _use_color()
 
+def _c(s: str, code: str) -> str:
+    if not _USE_COLOR:
+        return s
+    return f"{code}{s}\033[0m"
 
-def _info(txt: str) -> str:
-    return _c(txt, "1;36")  # bold cyan
+def _ok(s: str) -> str:
+    return _c(s, "\033[32m")  # green
 
+def _warn(s: str) -> str:
+    return _c(s, "\033[33m")  # yellow
 
-def _muted(txt: str) -> str:
-    return _c(txt, "2;37")  # dim gray
+def _bad(s: str) -> str:
+    return _c(s, "\033[31m")  # red
 
+def _info(s: str) -> str:
+    return _c(s, "\033[36m")  # cyan
+
+def _muted(s: str) -> str:
+    return _c(s, "\033[90m")  # grey
 
 def _fmt_pvalue(p: float | None) -> str:
     if p is None:
@@ -464,7 +853,7 @@ def _pick_file_interactive(dir_: Path, prefix: str) -> Path:
 # ----------------------------
 def _pick_regime_module(shared_dir: Path) -> str:
     # Import qui per evitare errori se lanciato fuori suite root
-    from loader_regime import list_regime_modules
+    from shared.loader_regime import list_regime_modules
 
     mods = list_regime_modules(shared_dir)  # deve già filtrare per regime_*
     if not mods:
@@ -483,7 +872,7 @@ def _pick_regime_module(shared_dir: Path) -> str:
 
 
 def _load_regime_apply(regime_module: str, shared_dir: Path):
-    from loader_regime import load_regime_apply
+    from shared.loader_regime import load_regime_apply
     return load_regime_apply(shared_dir, regime_module)
 
 
@@ -504,17 +893,47 @@ def _import_report_tools(suite_root: Path):
     from regime_filter_report.io_utils import write_single_csv_report
     return build_regime_report, write_single_csv_report
 
+from shared.regime_auto_calibration.engine import _get_default_target_bands
+
+
+
 # ============================================================
-# REGIME_L1 – Target di riferimento (timeframe 30m)
+# REGIME_L1 – Target di riferimento
 # Include tutti i regimi canonici + fallback UNKNOWN
 # ============================================================
-REGIME_L1_TARGETS_30M = {
+REGIME_L1_TARGETS = {
     "TREND":    (25.0, 45.0),
     "RANGE":    (30.0, 55.0),
     "LATERAL":  (30.0, 55.0),
-    "VOLATILE": (5.0,  20.0),
+    "VOLATILE": (0.0, 20.0),
     "UNKNOWN":  (0.0,  0.0),
 }
+
+def get_regime_l1_targets(timeframe: str) -> Dict[str, Tuple[float, float]]:
+    """
+    Ritorna le bande target per REGIME_L1 in base al timeframe.
+    Prima prova ad allinearsi all'engine (shared.regime_auto_calibration.engine),
+    altrimenti fallback al comportamento legacy del wizard.
+    """
+    tf = (timeframe or "").strip().lower()
+    tf = tf.replace("30min", "30m").replace("1day", "1d").replace("1hour", "1h").replace("1week", "1w")
+
+    # 1) Source of truth: engine (se disponibile)
+    try:
+        from shared.regime_auto_calibration.engine import _get_default_target_bands
+        bands = _get_default_target_bands(tf)
+        if isinstance(bands, dict) and bands:
+            return bands
+    except Exception:
+        pass
+
+    # 2) Legacy fallback (wizard-local)
+    tf_map = globals().get("REGIME_L1_TARGETS_BY_TF", None)
+    if isinstance(tf_map, dict) and tf in tf_map:
+        return tf_map[tf]
+
+    return REGIME_L1_TARGETS
+
 
 def _extract_regime_coverage_pct_from_sheets(sheets: dict, *, regime_col: str) -> dict[str, float]:
     """
@@ -560,13 +979,13 @@ def _extract_regime_coverage_pct_from_sheets(sheets: dict, *, regime_col: str) -
     out = {str(k).strip().upper(): float(v or 0.0) for k, v in out.items()}
 
     return out
-
 def print_regime_coverage_table_vs_target(
-    regime_coverage_pct: dict[str, float],
-    *,
-    targets: dict[str, tuple[float, float]] = REGIME_L1_TARGETS_30M,
-    timeframe_label: str = "30m",
+     regime_coverage_pct: dict[str, float],
+     *,
+     timeframe_label: str = "30m",
 ) -> tuple[list[dict], list[tuple[str, float]]]:
+
+    targets = get_regime_l1_targets(timeframe_label)
     regimes = list(targets.keys())
     extras = sorted([r for r in regime_coverage_pct.keys() if r not in targets])
     regimes += extras
@@ -633,6 +1052,229 @@ def print_regime_coverage_table_vs_target(
         print("\n[REGIME][STATUS] ✓ Coverage entro i range target")
 
     return coverage_table, out_of_target
+
+
+def print_regime_wizard_report(
+    df_r: pd.DataFrame,
+    *,
+    timeframe_label: str,
+    targets: dict[str, tuple[float, float]],
+    stats_sheet: pd.DataFrame,
+    coverage_table: list[dict] | None = None,
+    rows_total: int | None = None,
+    rows_allowed: int | None = None,
+    rows_blocked: int | None = None,
+    pct_blocked: float | None = None,
+    targets_fallback_warn: str | None = None,
+    show_verdict: bool = True,
+) -> dict:
+    """
+    STAMPA COMPLETA wizard-style in UNICA funzione pubblica richiamabile dall'esterno.
+
+    Ripristina output storico:
+    - ===== REGIME FILTER IMPACT =====
+    - [REGIME][WARN] (se presente)
+    - [REGIME][TARGET] + [REGIME][TABLE] + [REGIME][STATUS]
+    - ===== REGIME FILTER VALIDATION (STATS) =====
+      -- Chi2 vs Target --
+      -- Kruskal Tests --
+    Opzionale: show_verdict=True stampa anche il blocco A/B/C (nuovo).
+    Ritorna un dict payload (utile per test/pipeline).
+    """
+
+    # ---------------------------
+    # IMPACT
+    # ---------------------------
+    if rows_total is None:
+        rows_total = int(len(df_r))
+    if rows_allowed is None:
+        rows_allowed = int(rows_total)
+    if rows_blocked is None:
+        rows_blocked = int(0)
+    if pct_blocked is None:
+        pct_blocked = float(0.0)
+
+    print("\n===== REGIME FILTER IMPACT =====")
+    print(f"rows_total: {rows_total}")
+    print(f"rows_allowed: {rows_allowed}")
+    print(f"rows_blocked: {rows_blocked}")
+    print(f"pct_blocked: {pct_blocked}")
+
+    # ---------------------------
+    # TARGET warning (fallback)
+    # ---------------------------
+    if targets_fallback_warn:
+        print(targets_fallback_warn)
+
+    # ---------------------------
+    # COVERAGE TABLE + STATUS
+    # ---------------------------
+    # compute coverage pct from df_r (assume colonna REGIME_L1 o REGIME_L1_RAW)
+    regime_col = "REGIME_L1" if "REGIME_L1" in df_r.columns else ("REGIME_L1_RAW" if "REGIME_L1_RAW" in df_r.columns else None)
+    if not regime_col:
+        raise ValueError("[REGIME][REPORT] colonna regime non trovata (attese: REGIME_L1 o REGIME_L1_RAW)")
+
+    cov = (
+        df_r[regime_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"": "UNKNOWN", "NAN": "UNKNOWN", "NONE": "UNKNOWN"})
+    )
+    regime_coverage_pct = (cov.value_counts(normalize=True) * 100.0).to_dict()
+
+    # --- ALIGN WITH ENGINE: canonical keys + TREND aggregation ---
+    # normalizza chiavi
+    regime_coverage_pct = {str(k).strip().upper(): float(v or 0.0) for k, v in regime_coverage_pct.items()}
+
+    # garantisci chiavi canoniche
+    for k in ["VOLATILE", "TREND_UP", "TREND_DOWN", "RANGE", "LATERAL", "UNKNOWN"]:
+        regime_coverage_pct.setdefault(k, 0.0)
+
+    # aggrega TREND = TREND_UP + TREND_DOWN
+    regime_coverage_pct["TREND"] = float(regime_coverage_pct.get("TREND_UP", 0.0) or 0.0) + float(
+        regime_coverage_pct.get("TREND_DOWN", 0.0) or 0.0)
+
+    # usa la funzione esistente che stampa target/table/status e ritorna coverage_table/out_list
+    coverage_table2, out_of_target = print_regime_coverage_table_vs_target(
+        regime_coverage_pct,
+        timeframe_label=timeframe_label,
+    )
+
+    # ---------------------------
+    # VALIDATION (STATS) - stampa come prima
+    # ---------------------------
+    print("\n===== REGIME FILTER VALIDATION (STATS) =====")
+
+    # Chi2 block
+    chi2_block = stats_sheet[stats_sheet["metric"].astype(str).str.startswith("chi2_")]
+    if not chi2_block.empty:
+        print("\n-- Chi2 vs Target --")
+        print("(Test di aderenza tra distribuzione osservata e midpoint dei target.")
+        print(" p-value < 0,05 → distribuzione significativamente diversa dal target.)")
+        for _, r in chi2_block.iterrows():
+            print(f"{str(r['metric']):20s} | {r['value']}")
+
+    # Kruskal block
+    kr_block = stats_sheet[stats_sheet["metric"].astype(str).str.startswith("kruskal_")]
+    if not kr_block.empty:
+        print("\n-- Kruskal Tests --")
+        print("(Test non parametrico di differenza tra regimi sui forward returns.")
+        print(" p-value < 0,05 → almeno un regime differisce in modo significativo.)")
+        for _, r in kr_block.iterrows():
+            print(f"{str(r['metric']):20s} | {r['value']}")
+
+    # ---------------------------
+    # VERDICT + TABELLE COLORATE (PRO) — UNA SOLA VOLTA
+    # ---------------------------
+    verdict_payload = {}
+    if show_verdict:
+        verdict_payload = print_regime_validation_report(
+            stats_sheet,
+            coverage_table=(coverage_table or coverage_table2),
+            title="REGIME VALIDATION VERDICT",
+        ) or {}
+
+    return {
+        "rows_total": rows_total,
+        "rows_allowed": rows_allowed,
+        "rows_blocked": rows_blocked,
+        "pct_blocked": pct_blocked,
+        "timeframe_label": timeframe_label,
+        "out_of_target": out_of_target,
+        "coverage_table": coverage_table2,
+        "verdict": verdict_payload,
+    }
+
+def print_regime_wizard_style_summary_from_config(
+    *,
+    input_csv: str,
+    config_csv: str,
+    timeframe: str = "1d",
+    classifier_module: str = "shared.regime_classifier_1",
+) -> None:
+    """
+    Wrapper pubblico (no-duplica-logica) per stampare:
+    - REGIME FILTER IMPACT
+    - TARGET + Coverage table + STATUS (riusa print_regime_coverage_table_vs_target)
+    - VALIDATION STATS + VERDICT + SUMMARY (riusa builder interno stats sheet)
+    """
+    from pathlib import Path
+    import importlib
+    import pandas as pd
+
+    input_csv = str(input_csv)
+    config_csv = str(config_csv)
+
+    # 1) Load data
+    df0 = pd.read_csv(input_csv)
+
+    # 2) Params dal config CSV (riusa loader già presente nel classifier core)
+    core = importlib.import_module(classifier_module)
+
+    # resolve params dal CSV: nei tuoi moduli core esiste _load_filter_defaults_from_csv()
+    # e apply_regime_L1 accetta cfg_keys dict con chiavi param->value.
+    # Qui non replichiamo parser: usiamo la stessa funzione del core se esposta,
+    # altrimenti fallback minimale tramite _import_report_tools (che nel wizard già esiste).
+    params = None
+
+    if hasattr(core, "_load_filter_defaults_from_csv"):
+        # swap temporaneo: forziamo il core a leggere quel config_csv (pattern già usato altrove)
+        # ma SOLO se il core legge da path fisso; se supporta argomento path, meglio.
+        try:
+            params = core._load_filter_defaults_from_csv(Path(config_csv))  # type: ignore
+        except TypeError:
+            # fallback: se la funzione non accetta path, usa tool del wizard (parser CSV già usato nel report)
+            rt = _import_report_tools()
+            params = rt.parse_config_csv_to_params(Path(config_csv))  # type: ignore
+    else:
+        rt = _import_report_tools()
+        params = rt.parse_config_csv_to_params(Path(config_csv))  # type: ignore
+
+    if not params:
+        raise ValueError(f"[WIZARD_SUMMARY] params vuoti da config_csv={config_csv}")
+
+    # 3) Applica regime via core (senza duplicare logica)
+    # Firma del tuo core: apply_regime_L1(df, regime_filter="L1", cfg_keys=...)
+    try:
+        df_r = core.apply_regime_L1(df0.copy(), regime_filter="L1", cfg_keys=params)  # type: ignore
+    except TypeError:
+        # fallback firma posizionale (più robusta)
+        df_r = core.apply_regime_L1(df0.copy(), "L1", params)  # type: ignore
+
+    # ---------------------------
+    # IMPACT (wizard style)
+    # ---------------------------
+    rows_total = len(df_r)
+    rows_allowed = rows_total
+    rows_blocked = 0
+    pct_blocked = 0.0
+
+
+    # ---------------------------
+    # STATS + VERDICT + SUMMARY (riuso builder interno)
+    # ---------------------------
+    # Il wizard già costruisce uno "stats_sheet" in stile report.
+    # Qui lo generiamo e lo stampiamo in console.
+    try:
+        stats_sheet = _build_regime_validation_stats_sheet(df_r)  # type: ignore
+    except TypeError:
+        # se richiede regime_col o altri argomenti, prova a passarli
+        stats_sheet = _build_regime_validation_stats_sheet(df_r, regime_col="REGIME_L1")  # type: ignore
+
+    # stampa sheet come fa il wizard (riusiamo formatter del wizard se esiste)
+    print("\n===== REGIME FILTER VALIDATION (STATS) =====")
+    # se lo sheet è DataFrame con colonne metric/value
+    if hasattr(stats_sheet, "iterrows"):
+        for _, r in stats_sheet.iterrows():
+            m = str(r.get("metric", ""))
+            v = r.get("value", "")
+            if m:
+                print(f"{m:20s} | {v}")
+    else:
+        # fallback string/lines
+        print(stats_sheet)
+
 
 
 # ----------------------------
@@ -729,6 +1371,37 @@ def main() -> int:
         else:
             print(f"[DBG][KPI_EU] {c}: MISSING")
 
+    # ------------------------------------------------------------
+    # ANSI COLORS (terminal output)
+    # ------------------------------------------------------------
+    class _C:
+        RESET = "\033[0m"
+        RED = "\033[31m"
+        GREEN = "\033[32m"
+        YELLOW = "\033[33m"
+        CYAN = "\033[36m"
+        BOLD = "\033[1m"
+
+    def _ansi(s: str, color: str) -> str:
+        return f"{color}{s}{_C.RESET}"
+
+    def _ok_bad(s: str) -> str:
+        s2 = str(s).upper().strip()
+        if s2 == "OK":
+            return _ansi(s, _C.GREEN)
+        if s2 == "BAD":
+            return _ansi(s, _C.RED)
+        return s
+
+    def _level_colored(msg: str, level: str) -> str:
+        lvl = str(level).upper().strip()
+        if lvl == "A":
+            return _ansi(msg, _C.GREEN)
+        if lvl == "B":
+            return _ansi(msg, _C.YELLOW)
+        if lvl == "C":
+            return _ansi(msg, _C.RED)
+        return msg
     # ------------------------------------------------------------
     # DEBUG RAW: stampa stringhe così come sono nel CSV (no conversion)
     # ------------------------------------------------------------
@@ -911,7 +1584,7 @@ def main() -> int:
         print("\n[DBG][REGIME1][RATES] (su righe valide KPI: n=%d)  bb_src=%s" % (n_valid, bb_src))
         print("[DBG][REGIME1][RATES] P(ATR_PCT>=atr_volatile_enter & ADX<adx_trend_enter) = %.2f%%" % (m_vol.sum() / n_valid * 100.0))
         print("[DBG][REGIME1][RATES] P(ADX>=adx_trend_enter) = %.2f%%" % (m_trend.sum() / n_valid * 100.0))
-        print("[DBG][REGIME1][RATES] P(RANGE core: ADX<adx_range_enter & ATR_PCT>=atr_range_enter & BBW>=bbw_enter) = %.2f%%" % (m_range.sum() / n_valid * 100.0))
+        print("[DBG][REGIME1][RATES] P(RANGE core: ADX<adx_range_enter & ATR_PCT>=atr_range_enter & BBW>=bb_width_range_enter) = %.2f%%" % (m_range.sum() / n_valid * 100.0))
 
         # quantili utili (min / p50 / p75 / max) per calibrare soglie
         def _q(s: pd.Series):
@@ -1010,648 +1683,40 @@ def main() -> int:
 
     # target set per timeframe (se non esistono i target dedicati, fallback a 30m)
     timeframe_label = _infer_timeframe_label_from_filename(str(in_file))
+    # targets timeframe-aware (con fallback + warning)
+    targets_fallback_warn = None
+    targets = get_regime_l1_targets(timeframe_label)
+    tf_map = globals().get("REGIME_L1_TARGETS_BY_TF", {})
+    if not isinstance(tf_map, dict) or timeframe_label not in tf_map:
+        targets_fallback_warn = (
+            f"[REGIME][WARN] Target band specifici per timeframe '{timeframe_label}' non trovati: "
+            "uso REGIME_L1_TARGETS (fallback)."
+        )
 
-    _targets_by_tf = {
-        "30m": REGIME_L1_TARGETS_30M,
-        "1h": globals().get("REGIME_L1_TARGETS_1H"),
-        "1d": globals().get("REGIME_L1_TARGETS_1D"),
-        "1w": globals().get("REGIME_L1_TARGETS_1W"),
-    }
 
-    targets = _targets_by_tf.get(timeframe_label) or REGIME_L1_TARGETS_30M
+        # ------------------------------------------------------------
+        # WIZARD OUTPUT: Validazione statistica (Kruskal/Chi2 ecc.)
+        # + aggiunta al CSV come sezione "REGIME_VALIDATION_STATS"
+        # ------------------------------------------------------------
 
-    if timeframe_label != "30m" and targets is REGIME_L1_TARGETS_30M:
-        print(
-            f"[REGIME][WARN] Target band specifici per timeframe '{timeframe_label}' non trovati: uso REGIME_L1_TARGETS_30M (fallback).")
-
-    print_regime_coverage_table_vs_target(
-        coverage_pct,
-        targets=targets,
-        timeframe_label=timeframe_label,
-    )
     # ------------------------------------------------------------
-    # WIZARD OUTPUT: Validazione statistica (Kruskal/Chi2 ecc.)
-    # + aggiunta al CSV come sezione "REGIME_VALIDATION_STATS"
+    # STATS SHEET (serve al report centralizzato)
     # ------------------------------------------------------------
-    print("\n===== REGIME FILTER VALIDATION (STATS) =====")
     stats_sheet = _build_regime_validation_stats_sheet(
         df2,
         regime_col="REGIME_L1",
         coverage_pct=coverage_pct,
-        targets=REGIME_L1_TARGETS_30M,
+        targets=targets,
     )
 
-    def _fmt(v):
-        try:
-            if v is None:
-                return ""
-            if isinstance(v, (float, np.floating)):
-                if np.isnan(v):
-                    return ""
-                return f"{float(v):.6f}".replace(".", ",")
-            if isinstance(v, (int, np.integer)):
-                return str(int(v))
-            return str(v)
-        except Exception:
-            return str(v)
-
-    if stats_sheet is None or stats_sheet.empty:
-        print("stats_available: NO")
-    else:
-
-        # ---------------------------
-        # 1) Chi2 block
-        # ---------------------------
-        chi2 = stats_sheet[stats_sheet["metric"].str.startswith("chi2_")]
-        if not chi2.empty:
-            print("\n-- Chi2 vs Target --")
-            print("(Test di aderenza tra distribuzione osservata e midpoint dei target.")
-            print(" p-value < 0,05 → distribuzione significativamente diversa dal target.)")
-
-            for _, r in chi2.iterrows():
-                print(f"{r['metric']:20s} | {_fmt(r['value'])}")
-
-        # ---------------------------
-        # 2) Kruskal blocks
-        # ---------------------------
-        kr = stats_sheet[stats_sheet["metric"].str.startswith("kruskal_")]
-        if not kr.empty:
-            print("\n-- Kruskal Tests --")
-            print("(Test non parametrico di differenza tra regimi sui forward returns.")
-            print(" p-value < 0,05 → almeno un regime differisce in modo significativo.)")
-
-            for _, r in kr.iterrows():
-                print(f"{r['metric']:20s} | {_fmt(r['value'])}")
-
-        # ---------------------------------------------------
-        # MINI VERDICT AUTOMATICO (A/B/C)
-        # ---------------------------------------------------
-        # Logica:
-        # - Informatività regimi: Kruskal r5 + (Cliff o spread)
-        # - Calibrazione coverage: out-of-band (delta), Chi² vs target, Unknown
-        #
-        # Output livelli:
-        # A = Non necessaria
-        # B = Raccomandata
-        # C = Assolutamente necessaria
-
-        def _get_metric(name):
-            row = stats_sheet[stats_sheet["metric"] == name]
-            if row.empty:
-                return None
-            return row["value"].iloc[0]
-
-        def _to_float(x, default=None):
-            try:
-                if x is None:
-                    return default
-                s = str(x).strip()
-                if s in ("", "nan", "None", "NaN"):
-                    return default
-                # supporto EU: "0,123" -> "0.123"
-                s = s.replace(",", ".")
-                return float(s)
-            except Exception:
-                return default
-
-        # ---------------------------
-        # 1) Informatività (r5)
-        # ---------------------------
-        kr_p = _to_float(_get_metric("kruskal_r5_pvalue"), default=None)
-
-        cliff_vals = stats_sheet[
-            stats_sheet["metric"].str.contains("cliff_r5_vs_best", na=False)
-        ]["value"].tolist()
-        cliff_vals = [_to_float(v, default=None) for v in cliff_vals]
-        cliff_vals = [v for v in cliff_vals if v is not None]
-        max_cliff = max([abs(v) for v in cliff_vals], default=0.0)
-
-        r5_means = stats_sheet[
-            stats_sheet["metric"].str.endswith(".r5_mean", na=False)
-        ]["value"].tolist()
-        r5_means = [_to_float(v, default=None) for v in r5_means]
-        r5_means = [v for v in r5_means if v is not None]
-        spread = (max(r5_means) - min(r5_means)) if len(r5_means) >= 2 else 0.0
-
-        # soglie (tarabili)
-        TH_KRUSKAL_OK = 0.05
-        TH_CLIFF_GOOD = 0.15
-        TH_SPREAD_GOOD = 0.0020
-
-        kr_good = (kr_p is not None) and (kr_p < TH_KRUSKAL_OK)
-        effect_good = (max_cliff >= TH_CLIFF_GOOD)
-        spread_good = (spread >= TH_SPREAD_GOOD)
-        info_good = bool(kr_good and (effect_good or spread_good))
-
-        # ---------------------------
-        # 2) Chi² coverage globale
-        # ---------------------------
-        chi2_p = _to_float(_get_metric("chi2_pvalue"), default=None)
-        chi2_bad = (chi2_p is not None) and (chi2_p < 0.05)
-
-        # ---------------------------
-        # 3) Coverage out-of-band (delta-to-band)
-        # ---------------------------
-        # Provo a leggere da una tabella coverage già calcolata (se esiste),
-        # altrimenti cerco fallback su metriche in stats_sheet (se le hai salvate lì).
-        #
-        # Formato atteso tabella coverage (consigliato):
-        # colonne: ["REGIME","OBSERVED %","TARGET %","DELTA to band","STATUS"]
-        #
-        # N.B. Regimi con target: TREND,RANGE,LATERAL,VOLATILE,UNKNOWN
-
-        TARGET_KEYS = ["TREND", "RANGE", "LATERAL", "VOLATILE", "UNKNOWN"]
-
-        def _extract_coverage_from_table(tab):
-            # accetta: DataFrame oppure list[dict]
-            if tab is None:
-                return 0, 0.0, 0.0, []
-
-            # caso list[dict]
-            if isinstance(tab, list):
-                rows = tab
-                deltas = []
-                out_list = []
-                for row in rows:
-                    reg = str(row.get("REGIME", "")).strip()
-                    if reg not in TARGET_KEYS:
-                        continue
-                    st = str(row.get("STATUS", "")).strip().upper()
-                    d = _to_float(row.get("DELTA to band", 0.0), default=0.0) or 0.0
-                    if st == "IN":
-                        d = 0.0
-                    elif st == "OUT":
-                        d = abs(d)
-                        out_list.append((reg, d))
-                    else:
-                        d = 0.0
-                    deltas.append(d)
-                n_out = len(out_list)
-                max_delta = max(deltas) if deltas else 0.0
-                sum_delta = sum(deltas) if deltas else 0.0
-                return n_out, max_delta, sum_delta, out_list
-
-            # caso DataFrame (come prima)
-            if getattr(tab, "empty", True):
-                return 0, 0.0, 0.0, []
-            cols = {c.strip(): c for c in tab.columns}
-            col_reg = cols.get("REGIME") or cols.get("regime")
-            col_status = cols.get("STATUS") or cols.get("status")
-            col_delta = cols.get("DELTA to band") or cols.get("DELTA_TO_BAND") or cols.get("delta_to_band")
-            if not (col_reg and col_status and col_delta):
-                return 0, 0.0, 0.0, []
-
-            df = tab.copy()
-            df[col_reg] = df[col_reg].astype(str).str.strip()
-            df[col_status] = df[col_status].astype(str).str.strip().str.upper()
-            df = df[df[col_reg].isin(TARGET_KEYS)]
-            if df.empty:
-                return 0, 0.0, 0.0, []
-
-            deltas = []
-            out_list = []
-            for _, r in df.iterrows():
-                st = str(r[col_status]).upper()
-                d = _to_float(r[col_delta], default=0.0) or 0.0
-                if st == "IN":
-                    d = 0.0
-                elif st == "OUT":
-                    d = abs(d)
-                    out_list.append((r[col_reg], d))
-                else:
-                    d = 0.0
-                deltas.append(d)
-
-            n_out = len(out_list)
-            max_delta = max(deltas) if deltas else 0.0
-            sum_delta = sum(deltas) if deltas else 0.0
-            return n_out, max_delta, sum_delta, out_list
-
-        def _extract_coverage_from_stats_sheet(ss):
-            # fallback: cerca metriche tipo:
-            # coverage.LATERAL.delta_to_band, coverage.LATERAL.status, coverage.UNKNOWN.observed_pct
-            # (se NON le hai, restituisce zeri)
-            def _m(reg, suffix):
-                return _to_float(_get_metric(f"coverage.{reg}.{suffix}"), default=None)
-
-            out_list = []
-            deltas = []
-            n_out = 0
-
-            for reg in TARGET_KEYS:
-                status = _get_metric(f"coverage.{reg}.status")
-                status = str(status).strip().upper() if status is not None else None
-                d = _m(reg, "delta_to_band")
-                if d is None:
-                    d = 0.0
-                if status == "IN":
-                    d = 0.0
-                elif status == "OUT":
-                    d = abs(d)
-                    out_list.append((reg, d))
-                    n_out += 1
-                else:
-                    d = 0.0
-                deltas.append(d)
-
-            max_delta = max(deltas) if deltas else 0.0
-            sum_delta = sum(deltas) if deltas else 0.0
-            return n_out, max_delta, sum_delta, out_list
-
-        # prova variabili coverage note (senza crash)
-        coverage_df = None
-        for _name in ("coverage_table", "coverage_sheet", "coverage_df", "df_coverage", "coverage_tbl"):
-            if _name in globals():
-                coverage_df = globals().get(_name)
-                break
-            if _name in locals():
-                coverage_df = locals().get(_name)
-                break
-
-        n_out, max_delta, sum_delta, out_list = _extract_coverage_from_table(coverage_df)
-        if n_out == 0 and max_delta == 0.0 and sum_delta == 0.0 and not out_list:
-            # fallback se tabella non disponibile o non nel formato atteso
-            n_out, max_delta, sum_delta, out_list = _extract_coverage_from_stats_sheet(stats_sheet)
-
-        # Unknown ok (target 0): se hai observed_pct in stats_sheet (fallback), altrimenti non blocca
-        unknown_obs = _to_float(_get_metric("coverage.UNKNOWN.observed_pct"), default=None)
-        unknown_ok = True if unknown_obs is None else (unknown_obs <= 0.5)  # tolleranza micro 0,5%
-
-        # ---------------------------
-        # 4) Regole A/B/C
-        # ---------------------------
-        # soglie calibrazione (tarabili)
-        TH_MAX_DELTA_B = 10.0
-        TH_SUM_DELTA_B = 15.0
-        TH_SUM_DELTA_C = 20.0
-        TH_N_OUT_C = 3
-
-        # A: non necessaria
-        is_A = (n_out == 0) and (not chi2_bad) and (unknown_ok is True)
-
-        # B: raccomandata (due casi)
-        is_B1 = (n_out >= 1) and (max_delta <= TH_MAX_DELTA_B) and (sum_delta <= TH_SUM_DELTA_B) and info_good
-        is_B2 = (chi2_bad is True) and (max_delta <= TH_MAX_DELTA_B) and (n_out <= 2)
-        is_B = (not is_A) and (is_B1 or is_B2)
-
-        # C: assolutamente necessaria (hard triggers)
-        is_C1 = (max_delta > TH_MAX_DELTA_B) or (sum_delta > TH_SUM_DELTA_C) or (n_out >= TH_N_OUT_C)
-        is_C2 = (unknown_ok is False)
-        is_C3 = (info_good is False)
-        is_C = (not is_A) and (not is_B) and (is_C1 or is_C2 or is_C3)
-
-        # fallback: se non classificato, metti B prudenziale
-        if is_A:
-            verdict = "A"
-            verdict_msg = "✅ CALIBRAZIONE NON NECESSARIA"
-        elif is_C:
-            verdict = "C"
-            verdict_msg = "⚠ CALIBRAZIONE ASSOLUTAMENTE NECESSARIA"
-        else:
-            verdict = "B"
-            verdict_msg = "ℹ️ CALIBRAZIONE RACCOMANDATA"
-
-        # ---------------------------
-        # 5) Stampa sintetica
-        # ---------------------------
-
-        # ---- ANSI COLORI ----
-        ANSI_RESET = "\033[0m"
-        ANSI_GREEN = "\033[92m"
-        ANSI_YELLOW = "\033[93m"
-        ANSI_RED = "\033[91m"
-        ANSI_BOLD = "\033[1m"
-
-        print("\n===== REGIME VALIDATION VERDICT (AUTO A/B/C) =====")
-
-        # ---- colore in base al livello ----
-        if verdict == "A":
-            color = ANSI_GREEN
-        elif verdict == "B":
-            color = ANSI_YELLOW
-        elif verdict == "C":
-            color = ANSI_RED
-        else:
-            color = ANSI_RED
-
-        print(f"{ANSI_BOLD}{color}{verdict_msg}  (level={verdict}){ANSI_RESET}")
-
-        # motivazioni compact, user-facing
-        reasons = []
-        if n_out > 0:
-            out_str = ", ".join([f"{r} Δ={_fmt(d)}" for r, d in out_list]) if out_list else f"n_out={n_out}"
-            reasons.append(f"coverage_out: {out_str} | maxΔ={_fmt(max_delta)} | sumΔ={_fmt(sum_delta)}")
-        if chi2_p is not None:
-            reasons.append(f"chi2_pvalue={_fmt(chi2_p)} ({'BAD' if chi2_bad else 'OK'})")
-        if kr_p is not None:
-            reasons.append(f"kruskal_r5_pvalue={_fmt(kr_p)} ({'OK' if kr_good else 'NO'})")
-        reasons.append(f"max|cliff_r5|={_fmt(max_cliff)} ({'OK' if effect_good else 'NO'})")
-        reasons.append(f"spread_r5_mean={_fmt(spread)} ({'OK' if spread_good else 'NO'})")
-        if unknown_obs is not None:
-            reasons.append(f"UNKNOWN_observed%={_fmt(unknown_obs)} ({'OK' if unknown_ok else 'BAD'})")
-
-        for r in reasons:
-            print(f"- {r}")
-
-        # ------------------------------------------------------------
-        # Coverage vs Target (Chi²): ricava p-value dal foglio stats (add -> stats_sheet)
-        # ------------------------------------------------------------
-        chi2_p_cov = None
-        try:
-            s = stats_sheet.loc[stats_sheet["metric"].eq("chi2_pvalue"), "value"]
-            if not s.empty:
-                raw = str(s.iloc[0]).strip()
-                if raw.startswith("<"):
-                    chi2_p_cov = 0.0
-                elif raw.upper().startswith("N/A") or raw == "":
-                    chi2_p_cov = None
-                else:
-                    # supporta EU con virgola decimale
-                    chi2_p_cov = float(raw.replace(",", "."))
-        except Exception:
-            chi2_p_cov = None
-
-        coverage_off_target = (chi2_p_cov is not None) and (chi2_p_cov < 0.05)
-
-        # ------------------------------------------------------------
-        # MINI VERDICT AUTOMATICO (A/B/C) — Calibrazione filtro
-        # ------------------------------------------------------------
-        def _to_float(x, default=None):
-            try:
-                if x is None:
-                    return default
-                s = str(x).strip()
-                if s in ("", "nan", "None", "NaN"):
-                    return default
-                return float(s.replace(",", "."))
-            except Exception:
-                return default
-
-        def _get_metric(name):
-            row = stats_sheet[stats_sheet["metric"] == name]
-            if row.empty:
-                return None
-            return row["value"].iloc[0]
-
-        # ---------------------------
-        # 1) Informatività (già nel tuo blocco o qui)
-        # ---------------------------
-        kr_p = _to_float(_get_metric("kruskal_r5_pvalue"), default=None)
-        kr_good = (kr_p is not None) and (kr_p < 0.05)
-
-        cliff_vals = stats_sheet[
-            stats_sheet["metric"].str.contains("cliff_r5_vs_best", na=False)
-        ]["value"].tolist()
-        cliff_vals = [_to_float(v, default=None) for v in cliff_vals]
-        cliff_vals = [v for v in cliff_vals if v is not None]
-        max_cliff = max([abs(v) for v in cliff_vals], default=0.0)
-
-        r5_means = stats_sheet[
-            stats_sheet["metric"].str.endswith(".r5_mean", na=False)
-        ]["value"].tolist()
-        r5_means = [_to_float(v, default=None) for v in r5_means]
-        r5_means = [v for v in r5_means if v is not None]
-        spread = (max(r5_means) - min(r5_means)) if len(r5_means) >= 2 else 0.0
-
-        TH_CLIFF_GOOD = 0.15
-        TH_SPREAD_GOOD = 0.0020
-        effect_good = (max_cliff >= TH_CLIFF_GOOD)
-        spread_good = (spread >= TH_SPREAD_GOOD)
-
-        info_good = bool(kr_good and (effect_good or spread_good))
-
-        # ---------------------------
-        # 2) Coverage badness (n_out, maxΔ, sumΔ)
-        # ---------------------------
-        TARGET_KEYS = ["TREND", "RANGE", "LATERAL", "VOLATILE", "UNKNOWN"]
-
-        def _extract_coverage_from_table(df_cov):
-            # formato atteso: REGIME, STATUS, DELTA to band
-            if df_cov is None or getattr(df_cov, "empty", True):
-                return 0, 0.0, 0.0, []
-            cols = {c.strip(): c for c in df_cov.columns}
-            col_reg = cols.get("REGIME") or cols.get("regime")
-            col_status = cols.get("STATUS") or cols.get("status")
-            col_delta = cols.get("DELTA to band") or cols.get("DELTA_TO_BAND") or cols.get("delta_to_band")
-            if not (col_reg and col_status and col_delta):
-                return 0, 0.0, 0.0, []
-
-            df = df_cov.copy()
-            df[col_reg] = df[col_reg].astype(str).str.strip()
-            df[col_status] = df[col_status].astype(str).str.strip().str.upper()
-            df = df[df[col_reg].isin(TARGET_KEYS)]
-            if df.empty:
-                return 0, 0.0, 0.0, []
-
-            deltas = []
-            out_list = []
-            for _, r in df.iterrows():
-                st = str(r[col_status]).upper()
-                d = _to_float(r[col_delta], default=0.0) or 0.0
-                if st == "IN":
-                    d = 0.0
-                elif st == "OUT":
-                    d = abs(d)
-                    out_list.append((r[col_reg], d))
-                else:
-                    d = 0.0
-                deltas.append(d)
-
-            n_out = len(out_list)
-            max_delta = max(deltas) if deltas else 0.0
-            sum_delta = sum(deltas) if deltas else 0.0
-            return n_out, max_delta, sum_delta, out_list
-
-        def _extract_coverage_from_stats(ss):
-            # fallback: metriche opzionali coverage.<REGIME>.status / delta_to_band / observed_pct
-            deltas = []
-            out_list = []
-            for reg in TARGET_KEYS:
-                st = _get_metric(f"coverage.{reg}.status")
-                st = str(st).strip().upper() if st is not None else None
-                d = _to_float(_get_metric(f"coverage.{reg}.delta_to_band"), default=0.0) or 0.0
-                if st == "IN":
-                    d = 0.0
-                elif st == "OUT":
-                    d = abs(d)
-                    out_list.append((reg, d))
-                else:
-                    d = 0.0
-                deltas.append(d)
-            n_out = len(out_list)
-            max_delta = max(deltas) if deltas else 0.0
-            sum_delta = sum(deltas) if deltas else 0.0
-            return n_out, max_delta, sum_delta, out_list
-
-        # prova variabili coverage note (se esistono)
-        coverage_df = None
-        for _name in ("coverage_table", "coverage_sheet", "coverage_df", "df_coverage", "coverage_tbl"):
-            if _name in locals():
-                coverage_df = locals().get(_name)
-                break
-            if _name in globals():
-                coverage_df = globals().get(_name)
-                break
-
-        n_out, max_delta, sum_delta, out_list = _extract_coverage_from_table(coverage_df)
-        if n_out == 0 and max_delta == 0.0 and sum_delta == 0.0 and not out_list:
-            n_out, max_delta, sum_delta, out_list = _extract_coverage_from_stats(stats_sheet)
-
-        # Unknown ok (target 0). Se non disponibile, non blocca.
-        unknown_obs = _to_float(_get_metric("coverage.UNKNOWN.observed_pct"), default=None)
-        unknown_ok = True if unknown_obs is None else (unknown_obs <= 0.5)
-
-        # ---------------------------
-        # 3) Regole A/B/C (calibrazione)
-        # ---------------------------
-        TH_MAX_DELTA_B = 10.0  # oltre -> C
-        TH_SUM_DELTA_B = 15.0
-        TH_SUM_DELTA_C = 20.0
-        TH_N_OUT_C = 3
-
-        chi2_bad = coverage_off_target  # usa il tuo boolean già calcolato
-
-        is_A = (n_out == 0) and (not chi2_bad) and (unknown_ok is True)
-
-        is_B1 = (n_out >= 1) and (max_delta <= TH_MAX_DELTA_B) and (sum_delta <= TH_SUM_DELTA_B) and info_good
-        is_B2 = (chi2_bad is True) and (max_delta <= TH_MAX_DELTA_B) and (n_out <= 2)
-        is_B = (not is_A) and (is_B1 or is_B2)
-
-        is_C1 = (max_delta > TH_MAX_DELTA_B) or (sum_delta > TH_SUM_DELTA_C) or (n_out >= TH_N_OUT_C)
-        is_C2 = (unknown_ok is False)
-        is_C3 = (info_good is False)
-        is_C = (not is_A) and (not is_B) and (is_C1 or is_C2 or is_C3)
-
-        if is_A:
-            verdict = "A"
-            verdict_msg = "✅ CALIBRAZIONE NON NECESSARIA"
-        elif is_C:
-            verdict = "C"
-            verdict_msg = "⚠ CALIBRAZIONE ASSOLUTAMENTE NECESSARIA"
-        else:
-            verdict = "B"
-            verdict_msg = "ℹ️ CALIBRAZIONE RACCOMANDATA"
-
-
-        # ------------------------------------------------------------
-        # VERDICT: differenziazione (Kruskal/Cliff/Spread) + coverage (Chi²)
-        # ------------------------------------------------------------
-        coverage_off_target = (chi2_p_cov is not None) and (chi2_p_cov < 0.05)
-
-        print("\n" + _info("===== REGIME VALIDATION VERDICT ====="))
-
-        if kr_p is not None and kr_p < 0.05 and max_cliff >= 0.147 and spread > 0.001:
-            if coverage_off_target:
-                print(_warn("⚠ Regimi informativi ma coverage fuori target (Chi²)"))
-                print(_muted("  (Differenziazione statistica OK, ma calibrazione distribuzione consigliata)"))
-            else:
-                print(_ok("✔ Regimi differenziati in modo robusto"))
-                print(_muted("  (Significatività statistica + effect size medio/grande + spread economico)"))
-
-        elif max_cliff >= 0.10 and spread > 0.0005:
-            print(_warn("⚠ Differenze moderate (possibile segnale, da monitorare)"))
-
-        else:
-            print(_bad("✖ Nessuna evidenza solida di differenziazione tra regimi"))
-
-        print(_info("  kruskal_pvalue_r5: ") + _fmt_pvalue(kr_p))
-        print(_info("  max|cliff_r5|: ") + _fmt_cliff(max_cliff))
-        print(_info("  spread r5_mean: ") + _fmt_spread(spread))
-
-        if coverage_off_target:
-            p_txt = "< 1e-6" if (chi2_p_cov is not None and chi2_p_cov < 1e-6) else f"{chi2_p_cov:.6f}"
-            print(_info("  chi2_pvalue_coverage: ") + _warn(p_txt))
-
-        # ---------------------------
-        # 3) Summary by regime (PRO)
-        # ---------------------------
-        print("\n" + _info("-- Summary by Regime (PRO) --"))
-        print(_muted("(Statistiche forward return r1/r5 per regime."))
-        print(_muted(" r*_hit = probabilità di rendimento positivo."))
-        print(_muted(" cliff5 = effect size vs miglior regime (range [-1,+1]).)"))
-
-        regime_metrics = stats_sheet[stats_sheet["metric"].str.contains(r"\.")]
-        regimes = sorted(set(m.split(".")[0] for m in regime_metrics["metric"]))
-
-        def _get(reg, suffix):
-            row = stats_sheet[stats_sheet["metric"] == f"{reg}.{suffix}"]
-            if row.empty:
-                return ""
-            return _fmt(row["value"].iloc[0])
-
-        cols = [
-            ("N", "n", 6),
-            ("r1_mean", "r1_mean", 12),
-            ("r1_med", "r1_median", 10),
-            ("r1_std", "r1_std", 10),
-            ("r1_hit", "r1_hit_rate", 9),
-            ("r5_mean", "r5_mean", 12),
-            ("r5_med", "r5_median", 10),
-            ("r5_std", "r5_std", 10),
-            ("r5_hit", "r5_hit_rate", 9),
-            ("cliff5", "cliff_r5_vs_best", 9),
-        ]
-
-        header = f"{'REGIME':12s} | " + " | ".join([f"{c[0]:>{c[2]}s}" for c in cols])
-        print(_info(header))
-        print(_muted("-" * len(header)))
-
-        # per ranking: raccogli r5_mean numerici
-        ranking = []
-        for reg in regimes:
-            r5m = stats_sheet[stats_sheet["metric"] == f"{reg}.r5_mean"]["value"]
-            r5m = float(r5m.iloc[0]) if (not r5m.empty and str(r5m.iloc[0]) != "nan") else np.nan
-            ranking.append((reg, r5m))
-
-        # best/worst
-        ranking_clean = [(r, v) for r, v in ranking if v == v]
-        best_reg = max(ranking_clean, key=lambda x: x[1])[0] if ranking_clean else None
-        worst_reg = min(ranking_clean, key=lambda x: x[1])[0] if ranking_clean else None
-
-        for reg in regimes:
-            reg_u = str(reg).strip().upper()
-
-            tag = ""
-            color_fn = None
-
-            if best_reg and reg == best_reg:
-                tag = " ★"
-                color_fn = _ok
-            elif worst_reg and reg == worst_reg:
-                tag = " ⚠"
-                color_fn = _bad
-            elif reg_u == "VOLATILE":
-                tag = " ⚠"
-                color_fn = _warn
-
-            line = f"{(reg + tag):12s} | " + " | ".join([f"{_get(reg, c[1]):>{c[2]}s}" for c in cols])
-
-            print(color_fn(line) if color_fn else line)
-
-        # ---------------------------
-        # 4) Ranking table (top/bottom)
-        # ---------------------------
-        if ranking_clean:
-            ranking_sorted = sorted(ranking_clean, key=lambda x: x[1], reverse=True)
-
-            def _print_rank(title, items):
-                print(f"\n-- {title} --")
-                print(f"{'REGIME':12s} | {'r5_mean':>12s}")
-                print("-" * 28)
-                for r, v in items:
-                    print(f"{r:12s} | {_fmt(v):>12s}")
-
-            top_n = min(5, len(ranking_sorted))
-            bot_n = min(5, len(ranking_sorted))
-
-            print("(Ranking per rendimento medio a 5 barre forward.)")
-            _print_rank(f"Top {top_n} by r5_mean", ranking_sorted[:top_n])
-
-            if len(ranking_sorted) > top_n:
-                _print_rank(f"Bottom {bot_n} by r5_mean", ranking_sorted[-bot_n:])
-            else:
-                print(f"\n-- Bottom {bot_n} by r5_mean --")
-                print("(non separato: numero regimi troppo basso, coincide con Top)")
+    _validation = print_regime_wizard_report(
+        df2,
+        timeframe_label=timeframe_label,
+        targets=targets,
+        stats_sheet=stats_sheet,
+        targets_fallback_warn=targets_fallback_warn,
+        show_verdict=True,
+    )
 
     # stampa compatta a video (metric/value)
     #if stats_sheet is not None and not stats_sheet.empty:
