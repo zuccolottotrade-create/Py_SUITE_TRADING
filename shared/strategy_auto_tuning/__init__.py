@@ -9,3 +9,5 @@ Vincoli v0:
 - Niente program synthesis (si ottimizzano solo parametri/enable/shift esistenti)
 - VOLATILE/UNKNOWN default NO TRADE
 """
+
+__codex_test__ = "20260303"
