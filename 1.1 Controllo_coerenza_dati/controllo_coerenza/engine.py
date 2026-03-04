@@ -132,66 +132,120 @@ def _invoke_rule(rule: Any, df: pd.DataFrame) -> Tuple[pd.Series, str]:
         mask = pd.Series(res, index=df.index)
         return mask.astype(bool), rname
 
-    # fallback: non riconosciuto
-    raise ValueError(
-        f"QC rule '{rname}' returned an unsupported result type: {type(res)}. "
-        "Expected mask, (mask, reason), dict, or object with passed_mask/mask."
-    )
-
-
 # ============================================================
-# QC runner
+# QC RUNNER (entrypoint per CLI)
 # ============================================================
 def run_qc(
     df: pd.DataFrame,
-    selected_rules: Optional[List[str]] = None
+    *,
+    selected_rules: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, QCStats]:
+    """
+    Applica le regole QC al DataFrame.
+
+    Returns:
+      cleaned_df, rejected_df, stats(QCStats)
+    """
+    if df is None or df.empty:
+        stats = QCStats(
+            total_rows=0,
+            kept_rows=0,
+            rejected_rows=0,
+            rejected_pct=0.0,
+            per_rule_rejections={},
+        )
+        return df.copy() if df is not None else pd.DataFrame(), pd.DataFrame(), stats
+
+    # ------------------------------------------------------------
+    # Meta: preserva symbol/isin se presenti in qualche riga
+    # ------------------------------------------------------------
+    meta = {}
+    if "symbol" in df.columns:
+        meta["symbol"] = _first_non_blank_value(df["symbol"])
+    else:
+        meta["symbol"] = None
+
+    if "isin" in df.columns:
+        meta["isin"] = _first_non_blank_value(df["isin"])
+    else:
+        meta["isin"] = None
+
+    # ------------------------------------------------------------
+    # Load rules registry
+    # ------------------------------------------------------------
     ensure_loaded()
-    rules = get_rules(selected_rules)
+    rules_map = get_rules()
 
-    print("[DEBUG] QC rules loaded:", [_rule_name(r) for r in rules])
+    # Normalizza a dict name->rule
+    if isinstance(rules_map, list):
+        rules_map = {_rule_name(r): r for r in rules_map}
+    elif not isinstance(rules_map, dict):
+        rules_map = {}
 
-    total = len(df)
+    # Filtro opzionale per nomi regola
+    if selected_rules:
+        wanted = set([str(x).strip() for x in selected_rules if str(x).strip() != ""])
+        rules_map = {name: rule for name, rule in rules_map.items() if name in wanted}
 
-    # snapshot metadata
-    meta_snapshot: Dict[str, Optional[str]] = {
-        "symbol": _first_non_blank_value(df["symbol"]) if "symbol" in df.columns else None,
-        "isin": _first_non_blank_value(df["isin"]) if "isin" in df.columns else None,
-    }
+    total_rows = len(df)
 
-    keep_mask = pd.Series(True, index=df.index)
-    reasons = pd.Series("", index=df.index)
-    per_rule: Dict[str, int] = {}
+    # Se non ci sono regole: no-op (ma stats coerenti)
+    if not rules_map:
+        cleaned = _ensure_metadata(df, meta)
+        rejected = df.iloc[0:0].copy()  # vuoto con stesse colonne
+        rejected = _ensure_metadata(rejected, meta)
 
-    for rule in rules:
-        rname = _rule_name(rule)
-        rule_mask, rule_reason = _invoke_rule(rule, df)
+        stats = QCStats(
+            total_rows=total_rows,
+            kept_rows=len(cleaned),
+            rejected_rows=0,
+            rejected_pct=0.0,
+            per_rule_rejections={},
+        )
+        return cleaned, rejected, stats
 
-        # allinea index e tipo
-        rule_keep = rule_mask.reindex(df.index, fill_value=False).astype(bool)
+    # ------------------------------------------------------------
+    # Apply rules (AND logico): una riga è tenuta solo se passa tutte
+    # ------------------------------------------------------------
+    kept_mask = pd.Series(True, index=df.index)
+    fail_rules = pd.Series("", index=df.index, dtype="object")  # accumulo motivi
+    per_rule_rej: Dict[str, int] = {}
 
-        newly_rejected = (keep_mask & ~rule_keep).sum()
-        per_rule[rname] = int(newly_rejected)
+    for name, rule in rules_map.items():
+        rule_mask, reason = _invoke_rule(rule, df)
 
-        to_mark = keep_mask & ~rule_keep
-        if to_mark.any():
-            reasons.loc[to_mark] = reasons.loc[to_mark].apply(
-                lambda s: rule_reason if s == "" else f"{s} | {rule_reason}"
-            )
+        # Conta rifiuti "marginali" tra quelli ancora kept
+        newly_rejected = kept_mask & (~rule_mask)
+        per_rule_rej[name] = int(newly_rejected.sum())
 
-        keep_mask = keep_mask & rule_keep
+        # Accumula reason sulle righe che falliscono (anche se già fallite prima)
+        # (manteniamo lista separata da ';')
+        fail_rules.loc[~rule_mask] = fail_rules.loc[~rule_mask].apply(
+            lambda s: (s + ";" if s else "") + str(reason)
+        )
 
-    cleaned = df.loc[keep_mask].copy()
-    rejected = df.loc[~keep_mask].copy()
-    rejected["QC_REASON"] = reasons.loc[~keep_mask].values
+        kept_mask &= rule_mask
 
-    # ripristina metadata se vuota
-    cleaned = _ensure_metadata(cleaned, meta_snapshot)
-    rejected = _ensure_metadata(rejected, meta_snapshot)
+    cleaned = df.loc[kept_mask].copy()
+    rejected = df.loc[~kept_mask].copy()
 
-    kept = int(keep_mask.sum())
-    rej = total - kept
-    pct = (rej / total * 100.0) if total else 0.0
+    # aggiungi colonna motivi sul rejected (utile a debug)
+    if not rejected.empty:
+        rejected["QC_FAIL_REASON"] = fail_rules.loc[~kept_mask].values
 
-    stats = QCStats(total, kept, rej, pct, per_rule)
+    cleaned = _ensure_metadata(cleaned, meta)
+    rejected = _ensure_metadata(rejected, meta)
+
+    rejected_rows = int((~kept_mask).sum())
+    kept_rows = int(kept_mask.sum())
+    rejected_pct = (rejected_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+
+    stats = QCStats(
+        total_rows=total_rows,
+        kept_rows=kept_rows,
+        rejected_rows=rejected_rows,
+        rejected_pct=rejected_pct,
+        per_rule_rejections=per_rule_rej,
+    )
+
     return cleaned, rejected, stats

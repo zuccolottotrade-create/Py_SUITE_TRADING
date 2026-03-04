@@ -6,6 +6,7 @@ import re
 
 import numpy as np
 import pandas as pd
+import itertools
 
 
 DEFAULT_NUM_COLS = ("open", "high", "low", "close", "volume")
@@ -26,31 +27,49 @@ def read_any_csv(path: Path, max_sample_bytes: int = 64_000) -> pd.DataFrame:
     """
     Lettura CSV robusta:
     1) sniff delimiter
-    2) read con header
-    3) se header non contiene colonne note -> retry header=None e mappa colonne per numero campi
+    2) rileva header reale (linea che contiene open/high/low/close)
+    3) skip eventuali righe iniziali non dati (es. label strumento)
+    4) fallback header=None se necessario (mapping per numero campi)
     """
     raw = path.read_bytes()
     sample = raw[:max_sample_bytes].decode("utf-8", errors="ignore")
     sep = _detect_delimiter(sample)
 
-    # 1) primo tentativo: header presente
+    lines = sample.splitlines()
+
+    # ------------------------------------------------------------
+    # 1) Rilevazione header reale (prime righe)
+    # ------------------------------------------------------------
+    header_row = None
+    known_cols = ("open", "high", "low", "close")
+
+    for i, line in enumerate(lines[:50]):
+        lower = line.lower()
+        if all(k in lower for k in known_cols):
+            header_row = i
+            break
+
+    # ------------------------------------------------------------
+    # 2) Lettura con header (skippando eventuale “spazzatura” iniziale)
+    # ------------------------------------------------------------
     df = pd.read_csv(
         path,
         sep=sep,
         dtype=str,
         encoding="utf-8",
         engine="python",
+        skiprows=header_row if header_row is not None else 0,
     )
 
     # se il file è vuoto o con 0 colonne, ritorna subito
     if df.shape[1] == 0:
         return df
 
-    # Heuristica: se non vedo nessuna colonna "nota", è probabile che NON ci sia header
-    known = {"date", "data", "time", "open", "high", "low", "close", "volume", "datetime", "symbol", "isin"}
-    cols = {str(c).strip().lower() for c in df.columns}
-    if len(cols.intersection(known)) == 0:
-        # 2) retry: header=None
+    # ------------------------------------------------------------
+    # 3) Fallback: se non vedo colonne OHLC, provo header=None e mapping
+    # ------------------------------------------------------------
+    cols_lower = {str(c).strip().lower() for c in df.columns}
+    if not any(c in cols_lower for c in known_cols):
         df2 = pd.read_csv(
             path,
             sep=sep,
@@ -59,18 +78,20 @@ def read_any_csv(path: Path, max_sample_bytes: int = 64_000) -> pd.DataFrame:
             engine="python",
             header=None,
         )
-        # mappa colonne in base a numero campi (minimo atteso 6: date time open high low close)
+
         n = df2.shape[1]
         if n >= 6:
             base = ["date", "time", "open", "high", "low", "close"]
             extra = []
             if n >= 7:
                 extra.append("volume")
-            # se ci sono ancora colonne, le chiamo colN
+
             while len(base) + len(extra) < n:
                 extra.append(f"col{len(base) + len(extra) + 1}")
+
             df2.columns = base + extra[: (n - len(base))]
             return df2
+
         return df2
 
     return df
@@ -153,6 +174,66 @@ def normalize_input(df: pd.DataFrame, source_path: Path | None = None) -> pd.Dat
             df[col] = _to_float_mixed_decimal(df[col])
         else:
             df[col] = np.nan
+
+    # ------------------------------------------------------------
+    # AUTO-DETECT OHLC ORDER (fix per feed con ordine colonne non standard)
+    # Se la coerenza OHLC è molto bassa, proviamo permutazioni per riallineare.
+    # ------------------------------------------------------------
+    def _ohlc_pass_rate(o_: pd.Series, h_: pd.Series, l_: pd.Series, c_: pd.Series) -> float:
+        m = (h_ >= l_) & (h_ >= o_) & (h_ >= c_) & (l_ <= o_) & (l_ <= c_)
+        m = m.fillna(False)
+        if len(m) == 0:
+            return 0.0
+        return float(m.mean())
+
+    # Consideriamo solo se abbiamo abbastanza dati numerici
+    if all(col in df.columns for col in ("open", "high", "low", "close")):
+        o0, h0, l0, c0 = df["open"], df["high"], df["low"], df["close"]
+
+        # sample per velocità e robustezza
+        sample_n = min(len(df), 2000)
+        o_s = o0.iloc[:sample_n]
+        h_s = h0.iloc[:sample_n]
+        l_s = l0.iloc[:sample_n]
+        c_s = c0.iloc[:sample_n]
+
+        base_rate = _ohlc_pass_rate(o_s, h_s, l_s, c_s)
+
+        # Se passa già bene, non tocchiamo nulla
+        # Soglia 0.60: se meno del 60% è coerente, probabile ordine sbagliato
+        if base_rate < 0.60:
+            cols = ["open", "high", "low", "close"]
+
+            best_rate = base_rate
+            best_perm = tuple(cols)
+
+            # prova tutte le permutazioni delle 4 colonne
+            for perm in itertools.permutations(cols, 4):
+                oo = df[perm[0]].iloc[:sample_n]
+                hh = df[perm[1]].iloc[:sample_n]
+                ll = df[perm[2]].iloc[:sample_n]
+                cc = df[perm[3]].iloc[:sample_n]
+                r = _ohlc_pass_rate(oo, hh, ll, cc)
+                if r > best_rate:
+                    best_rate = r
+                    best_perm = perm
+
+            # Applichiamo solo se il miglioramento è significativo
+            # e il best_rate diventa “sano”
+            if best_perm != tuple(cols) and (best_rate - base_rate) >= 0.20 and best_rate >= 0.80:
+                # rimappa colonne in modo coerente: open/high/low/close
+                df["open"] = df[best_perm[0]]
+                df["high"] = df[best_perm[1]]
+                df["low"] = df[best_perm[2]]
+                df["close"] = df[best_perm[3]]
+
+                # nota diagnostica (utile nel REJECTED)
+                df["PARSE_OHLC_ORDER"] = f"{best_perm} (rate {best_rate:.3f} from {base_rate:.3f})"
+            else:
+                df["PARSE_OHLC_ORDER"] = f"default (rate {base_rate:.3f})"
+        else:
+            df["PARSE_OHLC_ORDER"] = f"default (rate {base_rate:.3f})"
+
 
     # opzionali: symbol/isin
     for c in ("symbol", "isin"):

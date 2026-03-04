@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 
-print("[DEBUG] regime_classifier_1 loaded from:", __file__)
+print("[DEBUG] regime_classifier_EQQQ_1d loaded from:", __file__)
 
 def _to_float_series(x: pd.Series) -> pd.Series:
     """
@@ -85,15 +85,21 @@ def _find_repo_root(start: Path) -> Path:
 
 def _config_path_this_filter() -> Path:
     """
-    Config OBBLIGATORIO:
-      <REPO_ROOT>/_data/config_filtro_regime/config_filtro_regime_classifier_1.csv
+    Ritorna il path del CSV config per questo regime filter.
 
-    Nota: REPO_ROOT viene risolto risalendo da questo file (non dal CWD),
-    così funziona da qualunque working directory (wizard, pipeline, strategy_creator).
+    Standard:
+      <REPO_ROOT>/_data/config_filtro_regime/config_filtro_regime_classifier_<SUFFIX>.csv
+    dove <SUFFIX> viene dal nome del modulo:
+      regime_classifier_EQQQ_1d.py -> config_filtro_regime_classifier_EQQQ_1d.csv
     """
     repo_root = _find_repo_root(Path(__file__).resolve())
-    return repo_root / "_data" / "config_filtro_regime" / "config_filtro_regime_classifier_1.csv"
 
+    mod_stem = Path(__file__).stem  # es: "regime_classifier_EQQQ_1d"
+    cfg_name = mod_stem.replace(
+        "regime_classifier_", "config_filtro_regime_classifier_"
+    ) + ".csv"
+
+    return repo_root / "_data" / "config_filtro_regime" / cfg_name
 
 def _parse_decimal_comma(value: str, *, param: str = "") -> float:
     """
@@ -148,6 +154,29 @@ def _load_filter_defaults_from_csv() -> dict:
     """
     path = _config_path_this_filter()
 
+    # --- DEBUG CONFIG USAGE (BEGIN) ---
+    import hashlib
+    def _sha1_file(p):
+        b = p.read_bytes()
+        return hashlib.sha1(b).hexdigest(), len(b)
+
+    print(f"[REGIME_L1][CFG][READ] path={path.resolve()}")
+    try:
+        h, n = _sha1_file(path)
+        print(f"[REGIME_L1][CFG][READ] sha1={h} bytes={n}")
+    except Exception as e:
+        print(f"[REGIME_L1][CFG][READ][WARN] cannot hash file: {e}")
+    # --- DEBUG CONFIG USAGE (END) ---
+
+    print(f"[REGIME_L1][CFG][DEBUG] CSV atteso (computed) = {path}")
+    try:
+        st = path.stat()
+        print(f"[REGIME_L1][CFG][DEBUG] CSV mtime={st.st_mtime} size={st.st_size} bytes")
+    except Exception as e:
+        print(f"[REGIME_L1][CFG][DEBUG] CSV stat error: {e}")
+
+
+
     if not path.exists():
         print("\n❌❌❌  ALERT CONFIG FILTRO REGIME  ❌❌❌")
         print("[REGIME_L1][CFG] File di configurazione OBBLIGATORIO NON trovato:")
@@ -156,11 +185,47 @@ def _load_filter_defaults_from_csv() -> dict:
         raise SystemExit(1)
 
     # leggiamo come stringhe per controllare il formato numerico (virgola)
-    df_cfg = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
+    df_cfg = pd.read_csv(
+        path,
+        sep=None,
+        engine="python",
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8",
+        encoding_errors="replace",
+    )
+
+    # normalizza header
+    df_cfg.columns = [str(c).strip().lower() for c in df_cfg.columns]
+
+    # se header collassato (es. "param;value;note")
+    if len(df_cfg.columns) == 1 and ";" in df_cfg.columns[0]:
+        df_cfg = pd.read_csv(
+            path,
+            sep=";",
+            engine="python",
+            dtype=str,
+            keep_default_na=False,
+            encoding="utf-8",
+            encoding_errors="replace",
+        )
+        df_cfg.columns = [str(c).strip().lower() for c in df_cfg.columns]
 
     # --- schema richiesto per il CSV config ---
     required_cols = {"param", "value"}
     optional_cols = {"note"}
+
+    df_cfg = pd.read_csv(path, sep=";", dtype=str, keep_default_na=False)
+    df_cfg.columns = [str(c).strip().lower() for c in df_cfg.columns]
+
+    # rimuove righe vuote tipo ";;"
+    df_cfg = df_cfg[df_cfg["param"].astype(str).str.strip() != ""].copy()
+
+    # normalizza header: gestisce casi tipo " value " (spazi) o BOM
+    df_cfg.columns = [str(c).strip() for c in df_cfg.columns]
+
+    # --- schema richiesto per il CSV config ---
+    required_cols = {"param", "value"}
 
     missing = required_cols - set(df_cfg.columns)
     if missing:
@@ -437,8 +502,27 @@ def update_regime_state_Livello1(
 
     # RANGE vs LATERAL (REGIME1)
     # RANGE: ADX basso + ATR_PCT sufficiente + BB width sufficiente
+
     range_enter = (adx < adx_range_enter) & (atrp >= atr_range_enter) & (bb_width_pct >= bb_width_range_enter)
     range_ok_exit = (adx < adx_range_exit) & (atrp >= atr_range_exit) & (bb_width_pct >= bb_width_range_exit)
+
+    # --- DBG split rates: capire quale gate blocca RANGE (coerente con <=) ---
+    m_adx = (adx < adx_range_enter)
+    m_atr = (atrp <= atr_range_enter)
+    m_bbw = (bb_width_pct <= bb_width_range_enter)
+    m_all = m_adx & m_atr & m_bbw
+
+    def _rate(m):
+        return 100.0 * float(m.mean()) if len(m) else 0.0
+
+    print(
+        f"[DBG][REGIME1][LATERAL_CORE_SPLIT] "
+        f"P(ADX<adx_range_enter)={_rate(m_adx):.2f}% "
+        f"P(ATR<=atr_range_enter)={_rate(m_atr):.2f}% "
+        f"P(BBW<=bb_width_range_enter)={_rate(m_bbw):.2f}% "
+        f"P(ALL)={_rate(m_all):.2f}% "
+    )
+
 
     # LATERAL (REGIME1): ADX basso e non classificato come RANGE (fallback "calmo")
     lateral_enter = (adx < adx_range_enter) & ~range_enter
@@ -609,7 +693,68 @@ def apply_regime_L1(
         raise ValueError(f"[REGIME_L1] regime_filter non supportato: {regime_filter}")
 
     out = df.copy()
-    out = update_regime_state_Livello1(out)
+
+    # -------------------------------------------------
+    # HARD PASS-THROUGH OVERRIDES (auto-calibration)
+    # -------------------------------------------------
+    ov = overrides or {}
+
+
+
+    # filtra solo parametri supportati da update_regime_state_Livello1
+    import inspect
+    allowed = set(inspect.signature(update_regime_state_Livello1).parameters.keys())
+    allowed.discard("df")
+
+    ov_f = {k: v for k, v in ov.items() if k in allowed}
+
+    # -------------------------------------------------
+    # TYPE NORMALIZATION (rolling/window richiede int)
+    # -------------------------------------------------
+    def _to_int(x, default=None):
+        if x is None:
+            return default
+        try:
+            # gestisce "20", 20.0, "20.0"
+            return int(float(x))
+        except Exception:
+            return default
+
+    def _to_float(x, default=None):
+        if x is None:
+            return default
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    # chiavi che DEVONO essere int
+    for k in ("bb_period", "confirm_bars_trend", "confirm_bars_range", "confirm_bars_volatile"):
+        if k in ov_f:
+            ov_f[k] = _to_int(ov_f[k], ov_f[k])
+
+    # chiavi che DEVONO essere float (per safety; rolling non le usa, ma evita stringhe)
+    for k in ("bb_k", "bb_width_range_enter", "bb_width_range_exit"):
+        if k in ov_f:
+            ov_f[k] = _to_float(ov_f[k], ov_f[k])
+
+
+    # -------------------------------------------------
+    # AUTOSCALE ATR thresholds (evita mismatch 0.xx vs 1.xx)
+    # -------------------------------------------------
+    for k in ("atr_range_enter", "atr_range_exit", "atr_volatile_enter", "atr_volatile_exit"):
+        if k in ov_f and isinstance(ov_f[k], (int, float)):
+            # euristica: se sembra in scala 0-1 ma il dataset usa % in scala 0-100
+            if ov_f[k] < 0.5:
+                ov_f[k] = ov_f[k] * 100.0
+    if ov_f:
+        print(
+            "[DEBUG][REGIME_L1][OVERRIDE] "
+            f"apply_regime_L1 -> update_regime_state_Livello1 overrides={sorted(ov_f.keys())}"
+        )
+
+    out = update_regime_state_Livello1(out, **ov_f)
+
     return out
 
 

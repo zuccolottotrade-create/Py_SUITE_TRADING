@@ -27,11 +27,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     # NOTE: reso opzionale per compatibilità pipeline
-    p.add_argument(
-        "--output-dir",
-        required=False,
-        help="Directory dati (input/output). Se omessa → PY_SUITE_DATA_DIR o fallback a Py_SUITE_TRADING/_data/Test Data."
-    )
+
 
     p.add_argument(
         "--rules",
@@ -46,51 +42,36 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Prefisso file CLEAN di output (default: CLEAN_)"
     )
 
-    p.add_argument(
-        "--export-rejected",
-        action="store_true",
-        help="Esporta anche il file REJECTED_*.csv"
-    )
-
     return p
 
 
 # ============================================================
 # DIR RESOLUTION (pipeline-friendly)
 # ============================================================
-def resolve_data_dir(output_dir_arg: str | None) -> Path:
+def resolve_data_dir() -> Path:
     """
-    Risoluzione directory dati:
-    1) --output-dir (se fornita)
-    2) env PY_SUITE_DATA_DIR (se presente)
-    3) fallback: <Py_SUITE_TRADING>/_data/Test Data (assumendo module path dentro 1.1 Controllo_coerenza_dati)
+    Directory dati FISSA:
+    - Output (CLEAN_ e REJECTED_) scritto SOLO in: <PY_SUITE_ROOT>/_data/Test Data
+
+    NOTE:
+    - Eliminati riferimenti a --output-dir e PY_SUITE_DATA_DIR (non più supportati).
     """
-    if output_dir_arg:
-        return Path(output_dir_arg).expanduser().resolve()
-
-    env_dir = os.environ.get("PY_SUITE_DATA_DIR")
-    if env_dir:
-        return Path(env_dir).expanduser().resolve()
-
-    # fallback robusto: risali fino a Py_SUITE_TRADING (cartella padre della "1.1 Controllo_coerenza_dati")
-    # __file__ = .../1.1 Controllo_coerenza_dati/controllo_coerenza/cli.py
-    # parents[2] = .../1.1 Controllo_coerenza_dati
-    # parents[3] = .../Py_SUITE_TRADING
     try:
-        # PY_SUITE_ROOT deve puntare a /Users/claudio 1/Py_SUITE_TRADING
         suite_root = Path(
             os.environ.get(
                 "PY_SUITE_ROOT",
-                Path(__file__).resolve().parents[4]
+                Path(__file__).resolve().parents[4],
             )
         ).expanduser().resolve()
     except Exception:
         raise RuntimeError("Impossibile risolvere PY_SUITE_ROOT")
 
-    print("[DEBUG] suite_root =", suite_root)
-    print("[DEBUG] data_dir finale =", suite_root / "_data" / "Test Data")
+    fixed = (suite_root / "_data" / "Test Data").resolve()
 
-    return (suite_root / "_data" / "Test Data").resolve()
+    print("[DEBUG] suite_root =", suite_root)
+    print("[DEBUG] data_dir finale (FIXED) =", fixed)
+
+    return fixed
 
 
 # ============================================================
@@ -127,7 +108,8 @@ def pick_input_file(data_dir: Path) -> Path:
 def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
 
-    data_dir = resolve_data_dir(args.output_dir)
+    data_dir = resolve_data_dir()
+
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------
@@ -195,11 +177,18 @@ def main(argv: list[str] | None = None) -> int:
             "isin=", cleaned["isin"].dropna().unique()[:3],
         )
 
-    if args.export_rejected and not rejected.empty:
-        rej_name = f"REJECTED_{input_path.name}"
-        rej_path = data_dir / rej_name
-        export_csv(rejected, rej_path)
-        print(f"⚠️ REJECTED scritto: {rej_path}")
+    # ------------------------------------------------------------
+    # REJECTED (sempre scritto, anche se vuoto)
+    # ------------------------------------------------------------
+    rej_name = f"REJECTED_{input_path.name}"
+    rej_path = data_dir / rej_name
+
+    export_csv(rejected, rej_path)
+
+    print(
+        f"⚠️ REJECTED scritto: {rej_path} "
+        f"(rows={len(rejected)})"
+    )
 
     return 0
 

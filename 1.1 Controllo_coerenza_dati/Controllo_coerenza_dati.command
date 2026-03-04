@@ -27,9 +27,9 @@ done
 
 export PY_SUITE_ROOT="$ROOT_CANDIDATE"
 
-# Data dir default (se non già impostata dall’esterno)
-: "${PY_SUITE_DATA_DIR:=$PY_SUITE_ROOT/_data/Test Data}"
-export PY_SUITE_DATA_DIR
+# Output directory è fissa: <PY_SUITE_ROOT>/_data/Test Data
+# (nessuna variabile PY_SUITE_DATA_DIR: eliminata per evitare riferimenti a directory alternative)
+
 
 # --- Entra nella directory del modulo ---
 cd "$SCRIPT_DIR" || exit 1
@@ -53,7 +53,9 @@ echo "----------------------------------------------"
 echo " Avvio controllo coerenza dati"
 echo "----------------------------------------------"
 echo "[INFO] PY_SUITE_ROOT=$PY_SUITE_ROOT"
-echo "[INFO] PY_SUITE_DATA_DIR=$PY_SUITE_DATA_DIR"
+echo "[INFO] DATA_DIR (fixed) =$PY_SUITE_ROOT/_data/Test Data"
+
+
 echo
 
 python3 -m controllo_coerenza.cli
