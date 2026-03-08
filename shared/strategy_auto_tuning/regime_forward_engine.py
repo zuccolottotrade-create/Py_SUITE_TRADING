@@ -1,0 +1,634 @@
+# shared/strategy_auto_tuning/regime_forward_engine.py
+"""
+Regime-aware forward selection engine (v2).
+
+Goal
+- Compose a multi-regime strategy by progressively enabling regime blocks only if they improve
+  the objective (default: alpha = NetProfitStrategy - BuyHold; score = -alpha).
+- Optional interactive validation step per candidate regime (YES/NO).
+- Writes:
+  - selection_log.csv  (sep=';' EU decimals)
+  - regime_summary.csv (sep=';' EU decimals)
+  - best_composed.xlsx (via StrategyBuilder)
+
+Design notes
+- This module is orchestration logic. It delegates:
+  - evaluation to an evaluator callable (wrapper over run_strategia.py)
+  - config editing/merging to a builder callable (merge regime blocks into a composed xlsx)
+- Keep the interfaces minimal and inject dependencies to avoid tight coupling.
+
+Project standards
+- CSV separator ';'
+- EU decimal output (comma)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Any
+import json
+import math
+import time
+
+
+# -----------------------------
+# Data contracts
+# -----------------------------
+
+@dataclass(frozen=True)
+class EvalResult:
+    """Minimal evaluator output needed by forward selection."""
+    ok: bool
+    score: float
+    alpha: float
+    penalty: float
+
+    buy_hold_filo: float
+    net_profit_strat: float
+    n_trades_closed: int
+    max_dd: float
+
+    # Optional extras (kept as dict to avoid schema churn)
+    extras: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RegimeBlock:
+    """Represents the tuned best block for a single regime."""
+    regime: str
+    best_xlsx: Path
+
+    # Per-regime evaluation snapshot (optional; can be filled later)
+    profit_trades: float = float("nan")
+    profit_buyhold: float = float("nan")
+    alpha_regime: float = float("nan")
+    n_trades: int = 0
+    max_dd: float = float("nan")
+
+
+@dataclass(frozen=True)
+class SelectionStep:
+    step: int
+    s_before: str
+    candidate: str
+    s_after: str
+
+    # delta vs baseline S
+    score_before: float
+    score_after: float
+    alpha_before: float
+    alpha_after: float
+    alpha_delta: float
+
+    dd_before: float
+    dd_after: float
+    dd_delta: float
+
+    trades_before: int
+    trades_after: int
+    trades_delta: int
+
+    ok_after: bool
+    accepted: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class RegimeSummaryRow:
+    regime: str
+    enabled: bool
+    profit_trades: float
+    profit_buyhold: float
+    alpha: float
+    n_trades: int
+    marginal_contribution: float
+
+
+@dataclass(frozen=True)
+class ForwardSelectionSpec:
+    # candidate regimes to consider (order used only for tie-breaks / display)
+    candidate_regimes: Sequence[str]
+
+    # acceptance thresholds
+    eps_alpha: float = 0.0
+    dd_tolerance_ratio: float = 0.20  # allow DD to increase by up to +20% relative
+    n_trades_min: int = 0
+
+    # stop conditions
+    max_regimes: int = 99
+
+    # interactivity
+    interactive: bool = True
+    auto_accept: bool = False  # if True, accept any candidate that passes constraints
+
+    # stable objective: default score already incorporates penalty; we also apply constraints here
+    enforce_constraints: bool = True
+
+
+# -----------------------------
+# Type aliases for injected deps
+# -----------------------------
+
+# Evaluator signature:
+# - input_csv: path KPI dataset
+# - config_xlsx: strategy config
+# - timeframe: timeframe string (must be passed, never inferred)
+# - outdir: directory where evaluator writes its artifacts
+EvaluatorFn = Callable[[Path, Path, str, Path], EvalResult]
+
+# Builder signature:
+# - base_config: template xlsx (contains all conditions/archetypes)
+# - selected_blocks: list of RegimeBlock to enable/merge
+# - out_xlsx: destination for composed strategy
+StrategyBuilderFn = Callable[[Path, Sequence[RegimeBlock], Path], None]
+
+# Trade report callback (optional):
+# - eval_dir: directory containing evaluator artifacts
+# - regime: candidate regime for labeling
+TradeReporterFn = Callable[[Path, str], None]
+
+
+# -----------------------------
+# Small utilities (CSV EU formatting)
+# -----------------------------
+
+def _eu_num(x: Any) -> str:
+    """Format number with EU decimal comma. Keep ints without decimals."""
+    if x is None:
+        return ""
+    if isinstance(x, bool):
+        return "True" if x else "False"
+    if isinstance(x, (int,)):
+        return str(x)
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return ""
+        # keep a reasonable precision without scientific notation
+        s = f"{x:.10f}".rstrip("0").rstrip(".")
+        if s == "-0":
+            s = "0"
+        return s.replace(".", ",")
+    # fallback
+    return str(x)
+
+
+def _csv_write_semicolon(path: Path, header: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write(";".join(header) + "\n")
+        for r in rows:
+            f.write(";".join(_eu_num(v) for v in r) + "\n")
+
+
+def _now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+
+def _join_regimes(rs: Sequence[str]) -> str:
+    return "+".join(rs) if rs else "{}"
+
+
+# -----------------------------
+# Core engine
+# -----------------------------
+
+class RegimeForwardEngine:
+    """
+    Forward selection over regimes.
+
+    You provide:
+    - base_config_xlsx: the archetype/template xlsx
+    - tuned_blocks: map regime -> RegimeBlock(best.xlsx tuned for that regime)
+    - evaluator: wrapper that runs run_strategia.py and returns EvalResult
+    - builder: merges selected blocks into a composed xlsx
+    """
+
+    def __init__(
+        self,
+        evaluator: EvaluatorFn,
+        builder: StrategyBuilderFn,
+        trade_reporter: Optional[TradeReporterFn] = None,
+    ) -> None:
+        self._evaluator = evaluator
+        self._builder = builder
+        self._trade_reporter = trade_reporter
+
+    def run(
+        self,
+        *,
+        input_csv: Path,
+        timeframe: str,
+        base_config_xlsx: Path,
+        tuned_blocks: Dict[str, RegimeBlock],
+        outdir: Path,
+        spec: ForwardSelectionSpec,
+        seed: int = 42,
+    ) -> Dict[str, Any]:
+        """
+        Execute forward selection.
+
+        Returns a dict with:
+          - selected_regimes
+          - rejected_regimes
+          - best_composed_xlsx
+          - selection_log_csv
+          - regime_summary_csv
+        """
+        outdir = Path(outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        # runspec (minimal)
+        runspec = {
+            "ts": _now_ts(),
+            "seed": seed,
+            "timeframe": timeframe,
+            "input_csv": str(Path(input_csv)),
+            "base_config_xlsx": str(Path(base_config_xlsx)),
+            "candidate_regimes": list(spec.candidate_regimes),
+            "eps_alpha": spec.eps_alpha,
+            "dd_tolerance_ratio": spec.dd_tolerance_ratio,
+            "n_trades_min": spec.n_trades_min,
+            "interactive": spec.interactive,
+            "auto_accept": spec.auto_accept,
+        }
+        (outdir / "runspec.json").write_text(json.dumps(runspec, indent=2), encoding="utf-8")
+
+        # Baseline = evaluate composed strategy with S = {}
+        selected: List[str] = []
+        rejected: List[str] = []
+        steps: List[SelectionStep] = []
+
+        baseline_eval_dir = outdir / "selection" / "eval_baseline"
+        baseline_xlsx = outdir / "selection" / "baseline_composed.xlsx"
+        self._builder(base_config_xlsx, [], baseline_xlsx)
+        baseline = self._evaluator(input_csv, baseline_xlsx, timeframe, baseline_eval_dir)
+
+        current = baseline
+        current_xlsx = baseline_xlsx
+
+        # Summary rows (filled at end)
+        summary_rows: Dict[str, RegimeSummaryRow] = {}
+
+        # Helper: constraint check for accepting a candidate
+        def passes_constraints(before: EvalResult, after: EvalResult) -> Tuple[bool, str]:
+            if not after.ok:
+                return False, "evaluator_not_ok"
+            if spec.enforce_constraints:
+                if after.alpha < before.alpha + spec.eps_alpha:
+                    return False, f"alpha_not_improving_eps({spec.eps_alpha})"
+                if after.n_trades_closed < spec.n_trades_min:
+                    return False, f"n_trades_below_min({spec.n_trades_min})"
+                # DD tolerance relative to before (allow +dd_tolerance_ratio)
+                # If before DD is 0, allow any DD up to a small absolute threshold
+                if before.max_dd > 0:
+                    if after.max_dd > before.max_dd * (1.0 + spec.dd_tolerance_ratio):
+                        return False, f"dd_increase_above_tolerance({spec.dd_tolerance_ratio})"
+            return True, "ok"
+
+        # Loop
+        step_idx = 0
+        remaining = [r for r in spec.candidate_regimes if r in tuned_blocks]
+
+        while remaining and len(selected) < spec.max_regimes:
+            # Evaluate all candidates not yet selected/rejected
+            candidates = [r for r in remaining if (r not in selected and r not in rejected)]
+            if not candidates:
+                break
+
+            best_r: Optional[str] = None
+            best_eval: Optional[EvalResult] = None
+            best_eval_dir: Optional[Path] = None
+            best_xlsx_path: Optional[Path] = None
+
+            for r in candidates:
+                # compose S ∪ {r}
+                composed_xlsx = outdir / "selection" / "candidates" / f"candidate_{step_idx:02d}_{_join_regimes(selected+[r])}.xlsx"
+                eval_dir = outdir / "selection" / "eval" / f"step_{step_idx:02d}_{r}"
+                self._builder(base_config_xlsx, [tuned_blocks[x] for x in (selected + [r])], composed_xlsx)
+
+                res = self._evaluator(input_csv, composed_xlsx, timeframe, eval_dir)
+
+                # Higher score is better, consistent with engine.py / trials.csv ranking
+                if best_eval is None or res.score > best_eval.score:
+                    best_r = r
+                    best_eval = res
+                    best_eval_dir = eval_dir
+                    best_xlsx_path = composed_xlsx
+
+            if best_r is None or best_eval is None or best_eval_dir is None or best_xlsx_path is None:
+                break
+
+            # constraints
+            ok_constraints, reason_constraints = passes_constraints(current, best_eval)
+
+            # show trade report (optional) before asking user
+            if self._trade_reporter is not None:
+                try:
+                    self._trade_reporter(best_eval_dir, best_r)
+                except Exception:
+                    # do not fail selection due to reporting
+                    pass
+
+            accepted = False
+            reason = reason_constraints
+
+            if ok_constraints:
+                if spec.auto_accept and not spec.interactive:
+                    accepted = True
+                    reason = "auto_accept_noninteractive"
+                elif spec.auto_accept and spec.interactive:
+                    # keep deterministic: auto_accept overrides user interaction
+                    accepted = True
+                    reason = "auto_accept"
+                elif spec.interactive:
+                    accepted = self._ask_user_accept(best_r, current, best_eval)
+                    reason = "user_yes" if accepted else "user_no"
+                else:
+                    # non-interactive and not auto-accept: accept if improves
+                    accepted = True
+                    reason = "accepted_noninteractive"
+            else:
+                # Optional interactive override only for DD-only rejection cases:
+                # candidate improves score/alpha, evaluator is ok, but fails solely
+                # because drawdown increase is above tolerance.
+                is_dd_only_rejection = (
+                    spec.interactive
+                    and best_eval.ok
+                    and reason_constraints.startswith("dd_increase_above_tolerance")
+                    and best_eval.alpha >= current.alpha + spec.eps_alpha
+                    and best_eval.n_trades_closed >= spec.n_trades_min
+                    and best_eval.score > current.score
+                )
+                if is_dd_only_rejection:
+                    accepted = self._ask_user_accept_dd_override(best_r, current, best_eval, reason_constraints)
+                    reason = "user_override_dd" if accepted else "user_declined_dd_override"
+
+            # Log step
+            step = SelectionStep(
+                step=step_idx + 1,
+                s_before=_join_regimes(selected),
+                candidate=best_r,
+                s_after=_join_regimes(selected + ([best_r] if accepted else [])),
+                score_before=current.score,
+                score_after=best_eval.score,
+                alpha_before=current.alpha,
+                alpha_after=best_eval.alpha,
+                alpha_delta=best_eval.alpha - current.alpha,
+                dd_before=current.max_dd,
+                dd_after=best_eval.max_dd,
+                dd_delta=best_eval.max_dd - current.max_dd,
+                trades_before=current.n_trades_closed,
+                trades_after=best_eval.n_trades_closed,
+                trades_delta=best_eval.n_trades_closed - current.n_trades_closed,
+                ok_after=best_eval.ok,
+                accepted=accepted,
+                reason=reason,
+            )
+            steps.append(step)
+
+            # Apply decision
+            if accepted:
+                selected.append(best_r)
+                current = best_eval
+                current_xlsx = best_xlsx_path
+            else:
+                rejected.append(best_r)
+
+            # Stopping rule: if nothing can be accepted anymore, break early
+            # (simple heuristic: if best candidate fails constraints, no need to continue)
+            if not ok_constraints:
+                break
+
+            step_idx += 1
+
+        # Write best composed artifact
+        best_composed_xlsx = outdir / "selection" / "best_composed.xlsx"
+        self._builder(base_config_xlsx, [tuned_blocks[r] for r in selected], best_composed_xlsx)
+
+        # Evaluate final composed (for final_report)
+        final_eval_dir = outdir / "final_report"
+        final_eval = self._evaluator(input_csv, best_composed_xlsx, timeframe, final_eval_dir)
+
+        # Build regime summary:
+        # - profit_trades/profit_buyhold may be NaN if not provided by tuner; keep empty unless available.
+        # - marginal_contribution is computed from selection steps deltas when a regime is accepted.
+        mc_by_regime: Dict[str, float] = {}
+        for st in steps:
+            if st.accepted:
+                mc_by_regime[st.candidate] = st.alpha_delta
+
+        for r in spec.candidate_regimes:
+            block = tuned_blocks.get(r)
+            enabled = r in selected
+            profit_trades = block.profit_trades if block else float("nan")
+            profit_buyhold = block.profit_buyhold if block else float("nan")
+            alpha_r = block.alpha_regime if block else float("nan")
+            n_trades = block.n_trades if block else 0
+            mc = mc_by_regime.get(r, 0.0 if not enabled else mc_by_regime.get(r, 0.0))
+            summary_rows[r] = RegimeSummaryRow(
+                regime=r,
+                enabled=enabled,
+                profit_trades=profit_trades,
+                profit_buyhold=profit_buyhold,
+                alpha=alpha_r,
+                n_trades=n_trades,
+                marginal_contribution=mc,
+            )
+
+        # Write selection_log.csv
+        selection_log_csv = outdir / "selection" / "selection_log.csv"
+        _csv_write_semicolon(
+            selection_log_csv,
+            header=[
+                "step",
+                "S_before",
+                "candidate",
+                "S_after",
+                "score_before",
+                "score_after",
+                "alpha_before",
+                "alpha_after",
+                "alpha_delta",
+                "dd_before",
+                "dd_after",
+                "dd_delta",
+                "trades_before",
+                "trades_after",
+                "trades_delta",
+                "ok_after",
+                "accepted",
+                "reason",
+            ],
+            rows=[
+                [
+                    s.step,
+                    s.s_before,
+                    s.candidate,
+                    s.s_after,
+                    s.score_before,
+                    s.score_after,
+                    s.alpha_before,
+                    s.alpha_after,
+                    s.alpha_delta,
+                    s.dd_before,
+                    s.dd_after,
+                    s.dd_delta,
+                    s.trades_before,
+                    s.trades_after,
+                    s.trades_delta,
+                    s.ok_after,
+                    s.accepted,
+                    s.reason,
+                ]
+                for s in steps
+            ],
+        )
+
+        # Write regime_summary.csv
+        regime_summary_csv = outdir / "selection" / "regime_summary.csv"
+        _csv_write_semicolon(
+            regime_summary_csv,
+            header=[
+                "regime",
+                "enabled",
+                "profit_trades",
+                "profit_buyhold",
+                "alpha",
+                "n_trades",
+                "marginal_contribution",
+            ],
+            rows=[
+                [
+                    row.regime,
+                    row.enabled,
+                    row.profit_trades,
+                    row.profit_buyhold,
+                    row.alpha,
+                    row.n_trades,
+                    row.marginal_contribution,
+                ]
+                for row in (summary_rows[r] for r in spec.candidate_regimes if r in summary_rows)
+            ],
+        )
+
+        # Persist a compact JSON result (useful for cli.py)
+        result_json = outdir / "selection" / "selection_result.json"
+        result_payload = {
+            "selected_regimes": selected,
+            "rejected_regimes": rejected,
+            "baseline": asdict(baseline),
+            "final_eval": asdict(final_eval),
+            "best_composed_xlsx": str(best_composed_xlsx),
+            "selection_log_csv": str(selection_log_csv),
+            "regime_summary_csv": str(regime_summary_csv),
+        }
+        result_json.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
+
+        return result_payload
+
+    # -----------------------------
+    # Interactive prompt
+    # -----------------------------
+
+    def _ask_user_accept(self, regime: str, before: EvalResult, after: EvalResult) -> bool:
+        """
+        Ask the user if they want to enable trading for the regime.
+
+        This method intentionally prints a compact summary only.
+        Detailed trade list printing should be done by trade_reporter, if provided.
+        """
+        print("")
+        print("=== REGIME PROPOSAL ===")
+        print(f"Regime: {regime}")
+        print(f"Alpha before: {_eu_num(before.alpha)}  | Alpha after: {_eu_num(after.alpha)}  | Delta: {_eu_num(after.alpha - before.alpha)}")
+        print(f"Score before: {_eu_num(before.score)}  | Score after: {_eu_num(after.score)}")
+        print(f"DD before: {_eu_num(before.max_dd)}     | DD after: {_eu_num(after.max_dd)}")
+        print(f"Trades before: {before.n_trades_closed} | Trades after: {after.n_trades_closed}")
+        print("")
+        while True:
+            ans = input("Abilitare il trading per questo regime? [y/n] ").strip().lower()
+            if ans in ("y", "yes"):
+                return True
+            if ans in ("n", "no"):
+                return False
+            print("Risposta non valida. Inserisci 'y' oppure 'n'.")
+
+    def _ask_user_accept_dd_override(
+        self,
+        regime: str,
+        before: EvalResult,
+        after: EvalResult,
+        rejection_reason: str,
+    ) -> bool:
+        """
+        Ask the user whether to override a DD-only rejection.
+
+        Used only when the candidate improves alpha/score and remains evaluator-ok,
+        but exceeds the configured DD tolerance.
+        """
+        print("")
+        print("=== REGIME PROPOSAL (DD OVERRIDE) ===")
+        print(f"Regime: {regime}")
+        print(f"Motivo blocco automatico: {rejection_reason}")
+        print(
+            f"Alpha before: {_eu_num(before.alpha)}  | "
+            f"Alpha after: {_eu_num(after.alpha)}  | "
+            f"Delta: {_eu_num(after.alpha - before.alpha)}"
+        )
+        print(
+            f"Score before: {_eu_num(before.score)}  | "
+            f"Score after: {_eu_num(after.score)}"
+        )
+        print(
+            f"DD before: {_eu_num(before.max_dd)}     | "
+            f"DD after: {_eu_num(after.max_dd)}     | "
+            f"Delta: {_eu_num(after.max_dd - before.max_dd)}"
+        )
+        print(
+            f"Trades before: {before.n_trades_closed} | "
+            f"Trades after: {after.n_trades_closed} | "
+            f"Delta: {after.n_trades_closed - before.n_trades_closed}"
+        )
+        print("")
+        while True:
+            ans = input(
+                "Accettare comunque questo regime nonostante il drawdown più alto? [y/n] "
+            ).strip().lower()
+            if ans in ("y", "yes"):
+                return True
+            if ans in ("n", "no"):
+                return False
+            print("Risposta non valida. Inserisci 'y' oppure 'n'.")
+
+
+# -----------------------------
+# Convenience wrapper (for engine.py)
+# -----------------------------
+
+def run_regime_forward_selection(
+    *,
+    evaluator: EvaluatorFn,
+    builder: StrategyBuilderFn,
+    trade_reporter: Optional[TradeReporterFn],
+    input_csv: Path,
+    timeframe: str,
+    base_config_xlsx: Path,
+    tuned_blocks: Dict[str, RegimeBlock],
+    outdir: Path,
+    spec: ForwardSelectionSpec,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Functional wrapper to run the engine without instantiating the class externally.
+    """
+    eng = RegimeForwardEngine(evaluator=evaluator, builder=builder, trade_reporter=trade_reporter)
+    return eng.run(
+        input_csv=Path(input_csv),
+        timeframe=str(timeframe),
+        base_config_xlsx=Path(base_config_xlsx),
+        tuned_blocks=tuned_blocks,
+        outdir=Path(outdir),
+        spec=spec,
+        seed=seed,
+    )
