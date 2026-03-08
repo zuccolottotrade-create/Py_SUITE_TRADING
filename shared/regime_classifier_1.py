@@ -9,7 +9,9 @@ import json
 import os
 from pathlib import Path
 
-print("[DEBUG] regime_classifier_1 loaded from:", __file__)
+
+if os.environ.get("REGIME_DEBUG") == "1":
+    print("[DEBUG] regime_classifier_1 loaded from:", __file__)
 
 def _to_float_series(x: pd.Series) -> pd.Series:
     """
