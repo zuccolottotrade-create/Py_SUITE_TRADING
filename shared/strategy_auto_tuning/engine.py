@@ -20,13 +20,20 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import csv
 import json
+import re
+import shutil
+
 import pandas as pd
+from openpyxl import load_workbook
+
+
+
 
 from .evaluator import StrategyEvaluator
 from .mutator import write_trial_config
 from .space import build_space_from_tuning
 from .samplers import RandomSearchSampler
-from .objectives import ObjectiveSpec, compute_objective
+from .objectives import ObjectiveSpec, ObjectiveResult, compute_objective
 from .regime_forward_engine import (
     EvalResult,
     ForwardSelectionSpec,
@@ -34,10 +41,12 @@ from .regime_forward_engine import (
     run_regime_forward_selection,
 )
 
-from .io_config import read_tuning_sheet, write_tuning_sheet
-import re
-import shutil
-from openpyxl import load_workbook
+from .io_config import (
+    read_tuning_sheet,
+    write_tuning_sheet,
+    build_regime_wise_config_v3,
+)
+
 
 @dataclass(frozen=True)
 class RunSpec:
@@ -79,6 +88,9 @@ class TrialRow:
     buy_hold_profit: Optional[float]
     trial_config_xlsx: str
     eval_dir: str
+    evaluation_semantics: Optional[str] = None
+    gate_check_ok: Optional[bool] = None
+    bad_entry_count: Optional[int] = None
 
 def _read_trade_profit_list_from_signal_dir(signal_dir: object) -> list[float]:
     if signal_dir is None:
@@ -190,8 +202,14 @@ def _safe_profit_per_trade(profit: object, trade_count: object) -> float | None:
 
 def _read_trade_profit_list_from_best_xlsx(best_xlsx: object) -> list[float]:
     """
-    Given per-regime best.xlsx, search its sibling regime directory recursively
-    for the most relevant SIGNAL_*.csv and return the list of non-null Profit/Trade values.
+    Resolve trade profits for a per-regime best block.
+
+    Cases handled:
+    - best_xlsx = .../regime_G_XXX/best.xlsx
+    - best_xlsx = .../regime_G_XXX/trials/trial_000N.xlsx
+
+    In the tuned-trial case, SIGNAL artifacts usually live under sibling folders
+    such as eval/ or eval_baseline/, not under trials/.
     """
     if best_xlsx is None:
         return []
@@ -204,43 +222,46 @@ def _read_trade_profit_list_from_best_xlsx(best_xlsx: object) -> list[float]:
     if not best_path.exists():
         return []
 
-    regime_dir = best_path.parent
+    search_roots: list[Path] = []
 
-    try:
-        candidates = [
-            p for p in regime_dir.rglob("SIGNAL_*.csv")
-            if p.is_file() and not p.name.startswith("TRADE_FREQ_")
-        ]
-    except Exception:
-        return []
+    def _add_root(p: Path | None) -> None:
+        if p is None:
+            return
+        try:
+            pp = Path(p)
+        except Exception:
+            return
+        if not pp.exists():
+            return
+        if pp not in search_roots:
+            search_roots.append(pp)
 
-    if not candidates:
-        return []
+    parent = best_path.parent
+    _add_root(parent)
 
-    # Prefer deeper/newer artifacts, usually under report/ or eval/ of the best trial.
-    candidates = sorted(
-        candidates,
-        key=lambda p: (len(p.parts), p.stat().st_mtime),
-        reverse=True,
-    )
+    # If best_xlsx is inside .../trials/trial_XXXX.xlsx, the real SIGNALs are
+    # typically under sibling eval/ or eval_baseline/ folders at regime-root level.
+    if parent.name.lower() == "trials":
+        regime_root = parent.parent
+        _add_root(regime_root)
+        _add_root(regime_root / "eval")
+        _add_root(regime_root / "eval_baseline")
 
-    signal_csv = candidates[0]
+    # Generic fallback: walk ancestors and prefer any regime_* folder plus its
+    # common evaluation subfolders.
+    for anc in best_path.parents:
+        name = anc.name.lower()
+        if name.startswith("regime_"):
+            _add_root(anc)
+            _add_root(anc / "eval")
+            _add_root(anc / "eval_baseline")
 
-    try:
-        df = pd.read_csv(signal_csv, sep=";", engine="python")
-    except Exception:
-        return []
+    for root in search_roots:
+        vals = _read_trade_profit_list_from_signal_dir(root)
+        if vals:
+            return vals
 
-    if "Profit/Trade" not in df.columns:
-        return []
-
-    vals = []
-    for v in df["Profit/Trade"].tolist():
-        num = _to_float_maybe(v)
-        if num is not None:
-            vals.append(num)
-
-    return vals
+    return []
 
 
 def _fmt_trade_list(values: list[float]) -> str:
@@ -262,6 +283,144 @@ def _decode_regime_code(value: object) -> str:
         4: "TREND_DOWN",
     }
     return mapping.get(code, str(code))
+
+
+def _group_to_regime_name(group_name: str) -> str:
+    mapping = {
+        "G_RANGE": "RANGE",
+        "G_LATERAL": "LATERAL",
+        "G_VOLATILE": "VOLATILE",
+        "G_TREND_UP": "TREND_UP",
+        "G_TREND_DOWN": "TREND_DOWN",
+        "G_UNKNOWN": "UNKNOWN",
+    }
+    g = str(group_name).strip().upper()
+    return mapping.get(g, g.replace("G_", "", 1))
+
+
+def _pick_first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lut = {str(c).strip().lower(): c for c in df.columns}
+    for name in candidates:
+        key = str(name).strip().lower()
+        if key in lut:
+            return lut[key]
+    return None
+
+
+def _read_signal_csv_auto(signal_csv: Path) -> pd.DataFrame:
+    signal_csv = Path(signal_csv)
+    try:
+        return pd.read_csv(signal_csv, sep=";", engine="python")
+    except Exception:
+        return pd.read_csv(signal_csv)
+
+
+def _verify_entries_only_on_target_regime(
+    *,
+    signal_csv: Path,
+    target_regime_name: str,
+) -> dict[str, Any]:
+    """
+    v3 gate-check:
+    every HOLD OUT -> IN transition must occur on target regime.
+    Exits are intentionally unconstrained.
+    """
+    signal_csv = Path(signal_csv)
+    if not signal_csv.exists():
+        return {
+            "ok": False,
+            "reason": "signal_csv_not_found",
+            "entry_count": 0,
+            "bad_entry_count": 0,
+            "violations": [],
+        }
+
+    df = _read_signal_csv_auto(signal_csv)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    hold_col = _pick_first_existing_column(df, ["HOLD", "hold", "Hold"])
+
+    regime_col = _pick_first_existing_column(
+        df,
+        ["REGIME_L1", "REGIME_L1_RAW", "REGIME_L1_CODE"],
+    )
+
+    if hold_col is None:
+        return {
+            "ok": False,
+            "reason": "missing_hold_column",
+            "entry_count": 0,
+            "bad_entry_count": 0,
+            "violations": [],
+        }
+
+    if regime_col is None:
+        return {
+            "ok": False,
+            "reason": "missing_regime_column",
+            "entry_count": 0,
+            "bad_entry_count": 0,
+            "violations": [],
+        }
+
+    hold_series = df[hold_col].astype(str).str.strip().str.upper()
+    prev_hold = hold_series.shift(1).fillna("OUT")
+    curr_hold = hold_series.fillna("OUT")
+
+    target_name = str(target_regime_name).strip().upper()
+
+    regime_raw = df[regime_col]
+
+    if str(regime_col).strip().upper() == "REGIME_L1_CODE":
+        regime_series = regime_raw.map(_decode_regime_code).astype(str).str.strip().str.upper()
+    else:
+        regime_series = regime_raw.astype(str).str.strip().str.upper()
+
+    entry_mask = (prev_hold == "OUT") & (curr_hold == "IN")
+    bad_mask = entry_mask & (regime_series != target_name)
+
+    violations: list[dict[str, Any]] = []
+
+    date_col = _pick_first_existing_column(df, ["Date", "Datetime", "date", "datetime", "timestamp"])
+
+    for ix in df.index[bad_mask].tolist()[:50]:
+        item: dict[str, Any] = {
+            "row_index": int(ix),
+            "regime_found": str(regime_series.loc[ix]),
+        }
+        if date_col is not None:
+            item["date"] = str(df.loc[ix, date_col])
+        violations.append(item)
+
+    return {
+        "ok": len(violations) == 0,
+        "reason": "" if len(violations) == 0 else "entry_outside_target_regime",
+        "entry_count": int(entry_mask.sum()),
+        "bad_entry_count": int(bad_mask.sum()),
+        "target_regime_name": target_name,
+        "signal_csv": str(signal_csv),
+        "violations": violations,
+    }
+
+def _apply_gate_check_to_objective(
+    obj: ObjectiveResult,
+    gate_check: dict[str, Any],
+    *,
+    penalty_hard: float = 1_000_000_000.0,
+) -> ObjectiveResult:
+    if gate_check.get("ok", False):
+        return obj
+
+    reason = gate_check.get("reason") or "entry_outside_target_regime"
+    penalty = max(float(obj.penalty), float(penalty_hard))
+
+    return ObjectiveResult(
+        alpha_vs_buyhold=obj.alpha_vs_buyhold,
+        score=-float(penalty_hard),
+        penalty=penalty,
+        ok=False,
+        reason=reason,
+    )
 
 
 def _read_final_composed_signal_csv(
@@ -493,6 +652,221 @@ def _normalize_best_xlsx(best_path: Path) -> None:
     wb.save(best_path)
     wb.close()
 
+
+def _read_sheet_as_df_preserve_order(xlsx_path: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Read an Excel sheet preserving the column order as returned by pandas/openpyxl.
+    Keep original values to make the export immediately usable for Excel copy/paste.
+    """
+    xlsx_path = Path(xlsx_path)
+    return pd.read_excel(xlsx_path, sheet_name=sheet_name, engine="openpyxl")
+
+
+def _write_tab_csv(df: pd.DataFrame, out_csv: Path) -> None:
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, sep="\t", index=False, header=True, encoding="utf-8")
+
+
+def _pick_existing_col_case_insensitive(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    lut = {str(c).strip().lower(): c for c in df.columns}
+    for name in candidates:
+        key = str(name).strip().lower()
+        if key in lut:
+            return lut[key]
+    return None
+
+
+def _filter_conditions_df_for_group(conditions_df: pd.DataFrame, target_group: str) -> pd.DataFrame:
+    group_col = _pick_existing_col_case_insensitive(conditions_df, ["group"])
+    if group_col is None:
+        raise ValueError("CONDITIONS sheet missing 'group' column")
+
+    target = str(target_group).strip().upper()
+    mask = (
+        conditions_df[group_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        == target
+    )
+    return conditions_df.loc[mask].copy()
+
+
+def _extract_condition_ids_for_group(conditions_df: pd.DataFrame, target_group: str) -> list[str]:
+    id_col = _pick_existing_col_case_insensitive(conditions_df, ["id"])
+    if id_col is None:
+        raise ValueError("CONDITIONS sheet missing 'id' column")
+
+    block_df = _filter_conditions_df_for_group(conditions_df, target_group)
+
+    out: list[str] = []
+    for v in block_df[id_col].tolist():
+        s = str(v).strip() if v is not None else ""
+        if s:
+            out.append(s)
+    return out
+
+
+def _filter_tuning_df_for_condition_ids(
+    tuning_df: pd.DataFrame,
+    condition_ids: list[str],
+) -> pd.DataFrame:
+    key_col = _pick_existing_col_case_insensitive(
+        tuning_df,
+        ["base_condition_id", "condition_id", "id"],
+    )
+    if key_col is None:
+        raise ValueError(
+            "TUNING sheet missing key column: expected one of "
+            "['base_condition_id', 'condition_id', 'id']"
+        )
+
+    wanted = {str(x).strip() for x in condition_ids if str(x).strip()}
+    mask = tuning_df[key_col].astype(str).str.strip().isin(wanted)
+    return tuning_df.loc[mask].copy()
+
+
+def _export_named_block_csvs(
+    *,
+    conditions_df: pd.DataFrame,
+    tuning_df: pd.DataFrame,
+    out_conditions_csv: Path,
+    out_tuning_csv: Path,
+) -> None:
+    _write_tab_csv(conditions_df, out_conditions_csv)
+    _write_tab_csv(tuning_df, out_tuning_csv)
+
+
+def _export_group_block_csvs_from_workbook(
+    *,
+    source_xlsx: Path,
+    base_tuning_xlsx: Path,
+    target_group: str,
+    out_dirs: list[Path],
+    conditions_filename: str = "best_CONDITIONS.csv",
+    tuning_filename: str = "best_TUNING.csv",
+) -> None:
+    """
+    Export one group/block:
+    - CONDITIONS from source_xlsx filtered by group
+    - TUNING from base_tuning_xlsx filtered by base_condition_id/condition_id/id
+      using the condition ids found in the selected CONDITIONS block
+    """
+    source_xlsx = Path(source_xlsx)
+    base_tuning_xlsx = Path(base_tuning_xlsx)
+
+    conditions_df = _read_sheet_as_df_preserve_order(source_xlsx, "CONDITIONS")
+    block_conditions_df = _filter_conditions_df_for_group(conditions_df, target_group)
+    condition_ids = _extract_condition_ids_for_group(conditions_df, target_group)
+
+    try:
+        tuning_df = _read_sheet_as_df_preserve_order(base_tuning_xlsx, "TUNING")
+        block_tuning_df = _filter_tuning_df_for_condition_ids(tuning_df, condition_ids)
+    except Exception:
+        # Keep export robust even if TUNING is absent or structurally different
+        block_tuning_df = pd.DataFrame()
+
+    for out_dir in out_dirs:
+        out_dir = Path(out_dir)
+        _export_named_block_csvs(
+            conditions_df=block_conditions_df,
+            tuning_df=block_tuning_df,
+            out_conditions_csv=out_dir / conditions_filename,
+            out_tuning_csv=out_dir / tuning_filename,
+        )
+
+
+def _export_multi_group_block_csvs_from_workbook(
+    *,
+    source_xlsx: Path,
+    base_tuning_xlsx: Path,
+    target_groups: list[str],
+    out_dir: Path,
+    conditions_filename: str = "best_CONDITIONS.csv",
+    tuning_filename: str = "best_TUNING.csv",
+) -> None:
+    """
+    Export multiple selected groups from a composed workbook:
+    - CONDITIONS from source_xlsx filtered by selected groups
+    - TUNING from base_tuning_xlsx filtered by the union of involved condition ids
+    """
+    source_xlsx = Path(source_xlsx)
+    base_tuning_xlsx = Path(base_tuning_xlsx)
+    out_dir = Path(out_dir)
+
+    conditions_df = _read_sheet_as_df_preserve_order(source_xlsx, "CONDITIONS")
+
+    group_col = _pick_existing_col_case_insensitive(conditions_df, ["group"])
+    id_col = _pick_existing_col_case_insensitive(conditions_df, ["id"])
+    if group_col is None or id_col is None:
+        raise ValueError("CONDITIONS sheet missing 'group' and/or 'id' column")
+
+    wanted_groups = {
+        str(g).strip().upper()
+        for g in (target_groups or [])
+        if str(g).strip()
+    }
+
+    cond_mask = (
+        conditions_df[group_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .isin(wanted_groups)
+    )
+    selected_conditions_df = conditions_df.loc[cond_mask].copy()
+
+    condition_ids = [
+        str(v).strip()
+        for v in selected_conditions_df[id_col].tolist()
+        if v is not None and str(v).strip()
+    ]
+
+    try:
+        tuning_df = _read_sheet_as_df_preserve_order(base_tuning_xlsx, "TUNING")
+        selected_tuning_df = _filter_tuning_df_for_condition_ids(tuning_df, condition_ids)
+    except Exception:
+        selected_tuning_df = pd.DataFrame()
+
+    _export_named_block_csvs(
+        conditions_df=selected_conditions_df,
+        tuning_df=selected_tuning_df,
+        out_conditions_csv=out_dir / conditions_filename,
+        out_tuning_csv=out_dir / tuning_filename,
+    )
+
+
+def _resolve_best_composed_xlsx(outdir: Path, selection_result: dict | None) -> Path | None:
+    """
+    Resolve the final composed workbook path with conservative fallbacks.
+    """
+    outdir = Path(outdir)
+
+    candidates: list[Path] = [
+        outdir / "selection" / "best_composed.xlsx",
+        outdir / "selection" / "baseline_composed.xlsx",
+    ]
+
+    if isinstance(selection_result, dict):
+        for key in (
+            "best_composed_xlsx",
+            "composed_xlsx",
+            "selected_config_xlsx",
+            "best_config_xlsx",
+        ):
+            value = selection_result.get(key)
+            if value:
+                candidates.append(Path(value))
+
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+
+    return None
+
+
+
 def _safe_group_dirname(group_name: str) -> str:
     s = str(group_name).strip()
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
@@ -564,34 +938,126 @@ def _normalize_group(v: Any) -> str:
     return str(v).strip() if v is not None else ""
 
 
-def detect_entry_groups(config_strategy: Path) -> List[str]:
-    wb, _header, _idx, rows = _read_conditions_rows(config_strategy)
+
+from pathlib import Path
+from openpyxl import load_workbook
+
+
+def _norm_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _norm_upper(value) -> str:
+    return _norm_text(value).upper()
+
+
+def _is_enabled_cell(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = _norm_upper(value)
+    return s in {"TRUE", "1", "YES", "Y", "ON"}
+
+
+def detect_entry_groups(config_strategy) -> list[str]:
+    """
+    Rileva i group che hanno almeno una riga ENTRY abilitata
+    nel foglio CONDITIONS del workbook config_strategy.
+    """
+    path = Path(config_strategy)
+    wb = load_workbook(path, data_only=False)
+
+    if "CONDITIONS" not in wb.sheetnames:
+        return []
+
+    ws = wb["CONDITIONS"]
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+
+    headers = [_norm_text(x) for x in rows[0]]
+    idx = {name: i for i, name in enumerate(headers)}
+
+    required = {"enabled", "scope", "group"}
+    if not required.issubset(idx.keys()):
+        return []
+
+    out = []
+    seen = set()
+
+    for row in rows[1:]:
+        group = _norm_text(row[idx["group"]])
+        scope = _norm_upper(row[idx["scope"]])
+        enabled = row[idx["enabled"]]
+
+        if not group:
+            continue
+        if scope != "ENTRY":
+            continue
+        if not _is_enabled_cell(enabled):
+            continue
+
+        if group not in seen:
+            seen.add(group)
+            out.append(group)
+
+    return out
+
+def _debug_dump_entry_rows(config_strategy) -> list[dict[str, Any]]:
+    path = Path(config_strategy)
+    wb = load_workbook(path, data_only=False)
+
+    if "CONDITIONS" not in wb.sheetnames:
+        return []
+
+    ws = wb["CONDITIONS"]
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+
+    headers = [_norm_text(x) for x in rows[0]]
+    idx = {name: i for i, name in enumerate(headers)}
+
+    required = {"id", "enabled", "scope", "side", "group"}
+    if not required.issubset(idx.keys()):
+        return []
+
+    out = []
+    for row in rows[1:]:
+        item = {
+            "id": _norm_text(row[idx["id"]]),
+            "enabled": row[idx["enabled"]],
+            "scope": _norm_text(row[idx["scope"]]),
+            "side": _norm_text(row[idx["side"]]),
+            "group": _norm_text(row[idx["group"]]),
+        }
+        if (
+            item["group"]
+            and _norm_upper(item["scope"]) == "ENTRY"
+            and _is_enabled_cell(item["enabled"])
+        ):
+            out.append(item)
+    return out
+
+
+def _print_debug_entry_rows(config_strategy) -> None:
     try:
-        groups: List[str] = []
-        seen = set()
+        rows = _debug_dump_entry_rows(config_strategy)
+        print(f"[DBG] active ENTRY rows from CONDITIONS = {len(rows)}")
+        for item in rows:
+            print(
+                "[DBG] ENTRY "
+                f"id={item['id']} "
+                f"enabled={item['enabled']} "
+                f"scope={item['scope']} "
+                f"side={item['side']} "
+                f"group={item['group']}"
+            )
+    except Exception as exc:
+        print(f"[DBG] unable to dump entry rows: {exc}")
 
-        for row in rows:
-            enabled = _is_truthy_enabled(row.get("enabled"))
-            scope = _normalize_scope(row.get("scope"))
-            side = _normalize_side(row.get("side"))
-            group = _normalize_group(row.get("group"))
 
-            if not enabled:
-                continue
-            if scope != "ENTRY":
-                continue
-            if side not in {"LONG", "SHORT", "BOTH", ""}:
-                continue
-            if not group:
-                continue
-
-            if group not in seen:
-                seen.add(group)
-                groups.append(group)
-
-        return groups
-    finally:
-        wb.close()
 def _decision_hint(
     *,
     trade_count: Any,
@@ -628,35 +1094,121 @@ def _write_masked_conditions_config(
     out_config_path: Path,
     active_entry_group: str,
 ) -> None:
-    wb = load_workbook(base_config_path)
-    if "CONDITIONS" not in wb.sheetnames:
-        wb.close()
-        raise ValueError("Missing CONDITIONS sheet in config_strategy")
+    """
+    Deprecated shim for backward compatibility.
 
-    ws = wb["CONDITIONS"]
-    header = [c.value for c in ws[1]]
-    idx = {str(name): i + 1 for i, name in enumerate(header) if name is not None}
+    v3.0 semantics:
+    - full dataset
+    - temporary config with only target group enabled
+    - no regime sub-dataset
+    """
+    build_regime_wise_config_v3(
+        base_xlsx_path=base_config_path,
+        out_xlsx_path=out_config_path,
+        target_group=active_entry_group,
+    )
 
-    required = ["enabled", "scope", "group"]
-    missing = [c for c in required if c not in idx]
+
+
+def _merge_forward_conditions_from_blocks(
+    *,
+    selected_blocks: List[RegimeBlock],
+    out_config_path: Path,
+) -> None:
+    """
+    Merge CONDITIONS rows from selected per-regime best.xlsx files into an already
+    composed config.
+
+    Expected workflow:
+    - out_config_path already exists and contains the baseline/composed CONDITIONS
+      produced from the external template
+    - for each selected block, read its CONDITIONS sheet
+    - copy row-level editable fields for rows belonging to block.regime
+    - match rows primarily by 'id'
+    - preserve rows from other groups as already written in out_config_path
+
+    Why this is needed:
+    forward selection cannot rely on TUNING-only merge because many strategy mutations
+    live directly in CONDITIONS (e.g. rhs_value / operator / logic / enabled).
+    """
+    if not selected_blocks:
+        return
+
+    composed_wb = load_workbook(out_config_path)
+    if "CONDITIONS" not in composed_wb.sheetnames:
+        composed_wb.close()
+        raise ValueError("Missing CONDITIONS sheet in composed config")
+
+    composed_ws = composed_wb["CONDITIONS"]
+    composed_header = [c.value for c in composed_ws[1]]
+    composed_idx = {str(name): i + 1 for i, name in enumerate(composed_header) if name is not None}
+
+    required = ["id", "group"]
+    missing = [c for c in required if c not in composed_idx]
     if missing:
-        wb.close()
-        raise ValueError(f"Missing CONDITIONS columns: {missing}")
+        composed_wb.close()
+        raise ValueError(f"Missing CONDITIONS columns in composed config: {missing}")
 
-    for r in range(2, ws.max_row + 1):
-        scope = _normalize_scope(ws.cell(r, idx["scope"]).value)
-        group = _normalize_group(ws.cell(r, idx["group"]).value)
+    editable_cols = ["enabled", "rhs_value", "shift"]
+    editable_cols = [c for c in editable_cols if c in composed_idx]
 
-        if scope == "ENTRY":
-            ws.cell(r, idx["enabled"]).value = (group == active_entry_group)
-        elif scope == "EXIT":
-            ws.cell(r, idx["enabled"]).value = (group == active_entry_group) or (group == "G_ANY")
-        else:
-            ws.cell(r, idx["enabled"]).value = False
+    composed_row_by_id: Dict[str, int] = {}
+    for r in range(2, composed_ws.max_row + 1):
+        row_id = composed_ws.cell(r, composed_idx["id"]).value
+        if row_id is None:
+            continue
+        composed_row_by_id[str(row_id)] = r
+
+    for block in selected_blocks:
+        block_wb = load_workbook(block.best_xlsx, data_only=False)
+        try:
+            if "CONDITIONS" not in block_wb.sheetnames:
+                raise ValueError(f"Missing CONDITIONS sheet in {block.best_xlsx}")
+
+            block_ws = block_wb["CONDITIONS"]
+            block_header = [c.value for c in block_ws[1]]
+            block_idx = {str(name): i + 1 for i, name in enumerate(block_header) if name is not None}
+
+            block_required = ["id", "group"]
+            block_missing = [c for c in block_required if c not in block_idx]
+            if block_missing:
+                raise ValueError(
+                    f"Missing CONDITIONS columns in {block.best_xlsx.name}: {block_missing}"
+                )
+
+            target_group = str(getattr(block, "regime", "") or "").strip().upper()
+            if not target_group:
+                continue
+
+            for r in range(2, block_ws.max_row + 1):
+                row_id = block_ws.cell(r, block_idx["id"]).value
+                row_group = block_ws.cell(r, block_idx["group"]).value
+
+                if row_id is None:
+                    continue
+
+                row_group_norm = str(row_group).strip().upper() if row_group is not None else ""
+                if row_group_norm != target_group:
+                    continue
+
+                row_id_str = str(row_id)
+                composed_r = composed_row_by_id.get(row_id_str)
+                if composed_r is None:
+                    continue
+
+                for col in editable_cols:
+                    if col not in block_idx:
+                        continue
+                    composed_ws.cell(composed_r, composed_idx[col]).value = block_ws.cell(
+                        r, block_idx[col]
+                    ).value
+        finally:
+            block_wb.close()
 
     out_config_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(out_config_path)
-    wb.close()
+    composed_wb.save(out_config_path)
+    composed_wb.close()
+
 
 def _write_forward_composed_conditions_config(
     *,
@@ -875,13 +1427,23 @@ def run_autotune_v1(
         eval_dir = outdir / "eval_baseline"
         eval_dir.mkdir(parents=True, exist_ok=True)
 
-        ev = evaluator.evaluate(
-            input_csv=input_csv,
-            config_strategy=config_strategy,
-            timeframe=timeframe,
-            outdir=eval_dir,
-            timeout_sec=timeout_sec,
-        )
+        if active_group:
+            ev = evaluator.evaluate_regime_wise_v3(
+                input_csv=input_csv,
+                config_strategy=config_strategy,
+                timeframe=timeframe,
+                outdir=eval_dir,
+                timeout_sec=timeout_sec,
+                target_regime_name=_group_to_regime_name(active_group),
+            )
+        else:
+            ev = evaluator.evaluate(
+                input_csv=input_csv,
+                config_strategy=config_strategy,
+                timeframe=timeframe,
+                outdir=eval_dir,
+                timeout_sec=timeout_sec,
+            )
 
         obj_spec = ObjectiveSpec(
             n_min_trades=n_min_trades,
@@ -889,6 +1451,31 @@ def run_autotune_v1(
         )
 
         obj = compute_objective(ev.metrics, obj_spec)
+
+
+        if active_group:
+            signal_csv_str = (getattr(ev.metrics, "extras", {}) or {}).get("signal_csv")
+            if signal_csv_str:
+                gate_check = _verify_entries_only_on_target_regime(
+                    signal_csv=Path(signal_csv_str),
+                    target_regime_name=_group_to_regime_name(active_group),
+                )
+            else:
+                gate_check = {
+                    "ok": False,
+                    "reason": "missing_signal_csv",
+                    "entry_count": 0,
+                    "bad_entry_count": 0,
+                    "violations": [],
+                }
+
+            extras = dict(getattr(ev.metrics, "extras", {}) or {})
+            extras["regime_gate_check"] = gate_check
+            extras["regime_eval_mode"] = "v3_full_dataset_target_entries_only"
+            extras["target_group"] = active_group
+            ev.metrics.extras = extras
+
+            obj = _apply_gate_check_to_objective(obj, gate_check)
 
         trials_csv = outdir / "trials.csv"
 
@@ -906,11 +1493,16 @@ def run_autotune_v1(
             "buy_hold_profit",
             "trial_config_xlsx",
             "eval_dir",
+            "evaluation_semantics",
+            "gate_check_ok",
+            "bad_entry_count",
         ]
 
         with trials_csv.open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
             w.writeheader()
+
+            gate_check = (getattr(ev.metrics, "extras", {}) or {}).get("regime_gate_check", {}) or {}
 
             row = {
                 "trial_id": 0,
@@ -926,6 +1518,9 @@ def run_autotune_v1(
                 "buy_hold_profit": ev.metrics.buy_hold_profit,
                 "trial_config_xlsx": str(config_strategy),
                 "eval_dir": str(eval_dir),
+                "evaluation_semantics": (getattr(ev.metrics, "extras", {}) or {}).get("regime_eval_mode"),
+                "gate_check_ok": gate_check.get("ok"),
+                "bad_entry_count": gate_check.get("bad_entry_count"),
             }
 
             w.writerow({k: _fmt_eu_num(v) for k, v in row.items()})
@@ -965,6 +1560,9 @@ def run_autotune_v1(
                      "buy_hold_profit",
                      "trial_config_xlsx",
                      "eval_dir",
+                     "evaluation_semantics",
+                     "gate_check_ok",
+                     "bad_entry_count",
     ] + [p.name for p in space.params]
 
     best_score = float("-inf")
@@ -989,16 +1587,54 @@ def run_autotune_v1(
             )
 
             # evaluate
-            ev = evaluator.evaluate(
-                input_csv=input_csv,
-                config_strategy=trial_config_xlsx,
-                timeframe=timeframe,
-                outdir=eval_dir,
-                timeout_sec=timeout_sec,
-            )
+            if active_group:
+                ev = evaluator.evaluate_regime_wise_v3(
+                    input_csv=input_csv,
+                    config_strategy=trial_config_xlsx,
+                    timeframe=timeframe,
+                    outdir=eval_dir,
+                    timeout_sec=timeout_sec,
+                    target_regime_name=_group_to_regime_name(active_group),
+                )
+            else:
+                ev = evaluator.evaluate(
+                    input_csv=input_csv,
+                    config_strategy=trial_config_xlsx,
+                    timeframe=timeframe,
+                    outdir=eval_dir,
+                    timeout_sec=timeout_sec,
+                )
+
+            # regime-wise v3 gate-check:
+            # enforce only when active_group is set (single-regime tuning)
+            gate_check = {}
+            if active_group:
+                signal_csv_str = (getattr(ev.metrics, "extras", {}) or {}).get("signal_csv")
+                if signal_csv_str:
+                    gate_check = _verify_entries_only_on_target_regime(
+                        signal_csv=Path(signal_csv_str),
+                        target_regime_name=_group_to_regime_name(active_group),
+                    )
+                else:
+                    gate_check = {
+                        "ok": False,
+                        "reason": "missing_signal_csv",
+                        "entry_count": 0,
+                        "bad_entry_count": 0,
+                        "violations": [],
+                    }
+
+                extras = dict(getattr(ev.metrics, "extras", {}) or {})
+                extras["regime_gate_check"] = gate_check
+                extras["regime_eval_mode"] = "v3_full_dataset_target_entries_only"
+                extras["target_group"] = active_group
+                ev.metrics.extras = extras
 
             # objective
             obj = compute_objective(ev.metrics, obj_spec)
+
+            if active_group and gate_check:
+                obj = _apply_gate_check_to_objective(obj, gate_check)
 
             display_best = max(best_score, obj.score) if best_score != float("-inf") else obj.score
             label = f"[{trial_label}] " if trial_label else ""
@@ -1007,6 +1643,8 @@ def run_autotune_v1(
                 end="",
                 flush=True,
             )
+
+            gate_check = (getattr(ev.metrics, "extras", {}) or {}).get("regime_gate_check", {}) or {}
 
             row: Dict[str, Any] = {
                 "trial_id": tid,
@@ -1022,6 +1660,9 @@ def run_autotune_v1(
                 "buy_hold_profit": ev.metrics.buy_hold_profit,
                 "trial_config_xlsx": str(trial_config_xlsx),
                 "eval_dir": str(eval_dir),
+                "evaluation_semantics": (getattr(ev.metrics, "extras", {}) or {}).get("regime_eval_mode"),
+                "gate_check_ok": gate_check.get("ok"),
+                "bad_entry_count": gate_check.get("bad_entry_count"),
             }
             # params
             for k, v in sample.params.items():
@@ -1080,12 +1721,32 @@ def run_autotune_regimes_v1(
     final_report_dir.mkdir(exist_ok=True)
 
     detected_groups = detect_entry_groups(config_strategy)
+    print(f"[DBG] detect_entry_groups config_strategy = {Path(config_strategy).resolve()}")
+    print(f"[DBG] detected_groups = {detected_groups}")
 
+    _print_debug_entry_rows(config_strategy)
+
+
+    # v3.0 semantics:
+    # - detected_groups are derived only from config_strategy
+    # - CLI --regimes is only a batch/orchestration filter
     if regimes:
         requested = [str(x).strip() for x in regimes if str(x).strip()]
         target_groups = [g for g in detected_groups if g in requested]
     else:
         target_groups = list(detected_groups)
+
+        print(f"[DBG] requested_regimes = {list(regimes) if regimes else []}")
+        print(f"[DBG] target_groups = {target_groups}")
+
+    if regimes and not target_groups:
+        requested_set = {str(x).strip() for x in regimes if str(x).strip()}
+        detected_set = set(detected_groups)
+        raise ValueError(
+            "No target groups matched the current config_strategy. "
+            f"requested={sorted(requested_set)} detected={sorted(detected_set)} "
+            f"config_strategy={Path(config_strategy).resolve()}"
+        )
 
     runspec = {
         "input_csv": str(input_csv),
@@ -1096,9 +1757,11 @@ def run_autotune_regimes_v1(
         "train_ratio": float(train_ratio),
         "outdir": str(outdir),
         "n_min_trades": int(n_min_trades),
+        "requested_groups": [str(x).strip() for x in regimes if str(x).strip()] if regimes else [],
         "detected_entry_groups": detected_groups,
         "target_groups": target_groups,
     }
+
     (outdir / "runspec_regimes.json").write_text(
         json.dumps(runspec, indent=2),
         encoding="utf-8",
@@ -1112,11 +1775,11 @@ def run_autotune_regimes_v1(
         regime_dir = per_regime_dir / f"regime_{safe_group}"
         regime_dir.mkdir(parents=True, exist_ok=True)
 
-        masked_base = regime_dir / "masked_base.xlsx"
-        _write_masked_conditions_config(
-            base_config_path=config_strategy,
-            out_config_path=masked_base,
-            active_entry_group=group_name,
+        masked_base = regime_dir / "regime_wise_v3_base.xlsx"
+        build_regime_wise_config_v3(
+            base_xlsx_path=config_strategy,
+            out_xlsx_path=masked_base,
+            target_group=group_name,
         )
 
         regime_seed = int(seed) + i - 1
@@ -1142,6 +1805,13 @@ def run_autotune_regimes_v1(
         best_dd = None
         best_score = None
 
+        # Source of truth aligned with trials.csv best row
+        best_trial_id = None
+        best_trial_config_xlsx = None
+        selected_best_xlsx = best_xlsx
+
+        df_sorted = pd.DataFrame()
+
         try:
             df = pd.read_csv(trials_csv, sep=";")
 
@@ -1166,16 +1836,68 @@ def run_autotune_regimes_v1(
                 df_sorted = df.sort_values("score", ascending=False, na_position="last")
                 best = df_sorted.iloc[0]
 
-
                 best_profit = best.get("profit")
                 best_trades = best.get("trade_count")
                 best_alpha = best.get("alpha_vs_buyhold")
                 best_dd = best.get("max_drawdown")
                 best_score = best.get("score")
 
+                best_trial_id = best.get("trial_id")
+                best_trial_config_raw = best.get("trial_config_xlsx")
 
-        except Exception:
-            pass
+                if best_trial_config_raw is not None:
+                    try:
+                        best_trial_config_xlsx = Path(str(best_trial_config_raw))
+                    except Exception:
+                        best_trial_config_xlsx = None
+
+                if best_trial_config_xlsx is not None and best_trial_config_xlsx.exists():
+                    selected_best_xlsx = best_trial_config_xlsx
+                else:
+                    selected_best_xlsx = best_xlsx
+
+                if (
+                    best_trial_config_xlsx is not None
+                    and best_trial_config_xlsx.exists()
+                    and best_xlsx.exists()
+                    and best_trial_config_xlsx.resolve() != best_xlsx.resolve()
+                ):
+                    print(
+                        f"[WARN] regime={group_name} trials.csv best differs from run best.xlsx: "
+                        f"trial_config_xlsx={best_trial_config_xlsx} best_xlsx={best_xlsx}"
+                    )
+
+                print(
+                    f"[DBG] regime={group_name} "
+                    f"best_trial_id={best_trial_id} "
+                    f"best_score={best_score} "
+                    f"best_trial_config_xlsx={best_trial_config_xlsx} "
+                    f"selected_best_xlsx={selected_best_xlsx}"
+                )
+
+        except Exception as exc:
+            print(f"[WARN] Could not read/sort trials for regime={group_name}: {exc}")
+
+        try:
+            _export_group_block_csvs_from_workbook(
+                source_xlsx=selected_best_xlsx,
+                base_tuning_xlsx=config_strategy,
+                target_group=group_name,
+                out_dirs=[regime_dir],
+                conditions_filename="best_CONDITIONS.csv",
+                tuning_filename="best_TUNING.csv",
+            )
+
+            _export_group_block_csvs_from_workbook(
+                source_xlsx=selected_best_xlsx,
+                base_tuning_xlsx=config_strategy,
+                target_group=group_name,
+                out_dirs=[final_report_dir],
+                conditions_filename=f"best_{group_name}_CONDITIONS.csv",
+                tuning_filename=f"best_{group_name}_TUNING.csv",
+            )
+        except Exception as exc:
+            print(f"[WARN] regime={group_name} export best csv failed: {exc}")
 
         decision_hint = _decision_hint(
             trade_count=best_trades,
@@ -1185,10 +1907,10 @@ def run_autotune_regimes_v1(
 
         # Candidate block for forward selection/composition
         try:
-            if best_xlsx.exists():
+            if selected_best_xlsx.exists():
                 tuned_blocks[group_name] = RegimeBlock(
                     regime=group_name,
-                    best_xlsx=best_xlsx,
+                    best_xlsx=selected_best_xlsx,
                     profit_trades=float(best_profit) if best_profit is not None and pd.notna(best_profit) else float("nan"),
                     profit_buyhold=(
                         float(best_profit) - float(best_alpha)
@@ -1207,6 +1929,18 @@ def run_autotune_regimes_v1(
         best_alpha_num = _to_float_maybe(best_alpha)
         best_trades_num = _to_float_maybe(best_trades)
 
+        gate_check_ok = None
+        bad_entry_count = None
+        try:
+            if len(df_sorted) > 0:
+                best_gate = df_sorted.iloc[0]
+                if "gate_check_ok" in best_gate.index:
+                    gate_check_ok = best_gate.get("gate_check_ok")
+                if "bad_entry_count" in best_gate.index:
+                    bad_entry_count = best_gate.get("bad_entry_count")
+        except Exception:
+            pass
+
         summary_rows.append(
             {
                 "group": group_name,
@@ -1222,7 +1956,9 @@ def run_autotune_regimes_v1(
                 "max_drawdown": _to_float_maybe(best_dd) if _to_float_maybe(best_dd) is not None else best_dd,
                 "score": _to_float_maybe(best_score) if _to_float_maybe(best_score) is not None else best_score,
                 "standalone_hint": decision_hint,
-                "best_xlsx": str(best_xlsx),
+                "best_xlsx": str(selected_best_xlsx),
+                "gate_check_ok": gate_check_ok,
+                "bad_entry_count": bad_entry_count,
             }
         )
 
@@ -1346,12 +2082,39 @@ def run_autotune_regimes_v1(
                     active_groups=active_groups,
                 )
 
-                # Step 2: merge TUNING from selected per-regime best.xlsx files
+                # Step 2: merge trial-specific CONDITIONS overrides from selected per-regime best.xlsx files
+                _merge_forward_conditions_from_blocks(
+                    selected_blocks=selected_blocks,
+                    out_config_path=out_xlsx,
+                )
+
+                try:
+                    dbg_wb = load_workbook(out_xlsx, data_only=True)
+                    if "CONDITIONS" in dbg_wb.sheetnames:
+                        dbg_ws = dbg_wb["CONDITIONS"]
+                        dbg_header = [c.value for c in dbg_ws[1]]
+                        dbg_idx = {str(name): i + 1 for i, name in enumerate(dbg_header) if name is not None}
+                        if "id" in dbg_idx and "rhs_value" in dbg_idx and "group" in dbg_idx:
+                            for r in range(2, dbg_ws.max_row + 1):
+                                row_id = dbg_ws.cell(r, dbg_idx["id"]).value
+                                row_group = dbg_ws.cell(r, dbg_idx["group"]).value
+                                if str(row_id) == "E_RA_RSI_LOW2" and str(row_group).strip().upper() == "G_RANGE":
+                                    rhs_val = dbg_ws.cell(r, dbg_idx["rhs_value"]).value
+                                    print(f"[DBG] composed candidate E_RA_RSI_LOW2 rhs_value={rhs_val}")
+                                    break
+                    dbg_wb.close()
+                except Exception:
+                    pass
+
+                # Step 3: merge TUNING from selected per-regime best.xlsx files
                 _merge_forward_tuning_from_blocks(
                     base_config_path=base_xlsx,
                     selected_blocks=selected_blocks,
                     out_config_path=out_xlsx,
                 )
+
+
+
             def _forward_trade_reporter(eval_dir: Path, regime: str) -> None:
                 return None
 
@@ -1369,6 +2132,46 @@ def run_autotune_regimes_v1(
             )
     except Exception as e:
         (selection_dir / "selection_error.txt").write_text(str(e), encoding="utf-8")
+
+
+    # ------------------------------------------------------------
+    # Export final composed best blocks (CONDITIONS + TUNING)
+    # ------------------------------------------------------------
+    try:
+        selected_groups_for_export: list[str] = []
+        if isinstance(selection_result, dict):
+            selected_groups_for_export = [
+                str(x).strip()
+                for x in (selection_result.get("selected_regimes") or [])
+                if str(x).strip()
+            ]
+
+        best_composed_xlsx = _resolve_best_composed_xlsx(outdir, selection_result)
+
+        if best_composed_xlsx is not None and selected_groups_for_export:
+            _export_multi_group_block_csvs_from_workbook(
+                source_xlsx=best_composed_xlsx,
+                base_tuning_xlsx=config_strategy,
+                target_groups=selected_groups_for_export,
+                out_dir=final_report_dir,
+                conditions_filename="best_CONDITIONS.csv",
+                tuning_filename="best_TUNING.csv",
+            )
+            print(
+                "[DBG] composed export done "
+                f"best_composed_xlsx={best_composed_xlsx} "
+                f"groups={selected_groups_for_export}"
+            )
+        else:
+            print(
+                "[DBG] composed export skipped "
+                f"best_composed_xlsx={best_composed_xlsx} "
+                f"groups={selected_groups_for_export}"
+            )
+    except Exception as exc:
+        print(f"[WARN] composed export best csv failed: {exc}")
+
+
 
     # Legacy per-regime summary (not the composed final report)
     summary_csv = outdir / "per_regime_summary.csv"
@@ -1437,6 +2240,8 @@ def run_autotune_regimes_v1(
         "score",
         "standalone_hint",
         "best_xlsx",
+        "gate_check_ok",
+        "bad_entry_count",
     ]
 
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
@@ -1567,5 +2372,4 @@ def run_autotune_regimes_v1(
     except Exception as e:
         print(f"\n[WARN] Could not print regime summary table: {e}")
 
-    return outdir
     return outdir
