@@ -1,0 +1,47 @@
+diff --git a/shared/strategy_auto_tuning/__init__.py b/shared/strategy_auto_tuning/__init__.py
+index ade8f3f..2ce2be7 100644
+--- a/shared/strategy_auto_tuning/__init__.py
++++ b/shared/strategy_auto_tuning/__init__.py
+@@ -18,4 +18,4 @@ __codex_test__ = "20260303"
+ 
+ def run_selftest() -> None:
+     ev = StrategyEvaluator()
+-    assert ev.run_script.exists()
++    assert ev.run_script.name == "run_strategia.py"
+diff --git a/shared/strategy_auto_tuning/evaluator.py b/shared/strategy_auto_tuning/evaluator.py
+index 712ed0e..2476947 100644
+--- a/shared/strategy_auto_tuning/evaluator.py
++++ b/shared/strategy_auto_tuning/evaluator.py
+@@ -28,6 +28,16 @@ class StrategyEvaluator:
+         self.root = py_suite_root
+         self.run_script = self.root / "3. Run_strategia" / "run_strategia.py"
+ 
++    @staticmethod
++    def _parse_float(match: re.Match[str] | None) -> float | None:
++        if not match:
++            return None
++        raw = match.group(1).strip().replace(",", ".")
++        try:
++            return float(raw)
++        except ValueError:
++            return None
++
+     def evaluate(
+         self,
+         *,
+@@ -60,11 +70,11 @@ class StrategyEvaluator:
+         stdout = proc.stdout
+         stderr = proc.stderr
+ 
+-        buy_hold_match = re.search(r"Buy & Hold \(FILO\):\s*([0-9\.\-]+)", stdout)
+-        np_match = re.search(r"Sum Profit/Trade .*:\s*([0-9\.\-]+)", stdout)
++        buy_hold_match = re.search(r"Buy & Hold \(FILO\):\s*([0-9,\.\-]+)", stdout)
++        np_match = re.search(r"Sum Profit/Trade .*:\s*([0-9,\.\-]+)", stdout)
+ 
+-        buy_hold_filo = float(buy_hold_match.group(1)) if buy_hold_match else None
+-        net_profit_strat = float(np_match.group(1)) if np_match else None
++        buy_hold_filo = self._parse_float(buy_hold_match)
++        net_profit_strat = self._parse_float(np_match)
+         n_trades = sum(1 for line in stdout.splitlines() if line.startswith("Trade "))
+ 
+         return EvalResult(

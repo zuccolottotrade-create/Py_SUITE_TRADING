@@ -93,7 +93,10 @@ class SelectionStep:
     accepted: bool
     reason: str
 
-
+# NOTE:
+# profit_trades / profit_buyhold / alpha / n_trades are intentionally left empty
+# in final regime_summary until they are computed from the FINAL COMPOSED SIGNAL_*.
+# This avoids mixing standalone regime metrics with composed-run metrics.
 @dataclass(frozen=True)
 class RegimeSummaryRow:
     regime: str
@@ -410,28 +413,44 @@ class RegimeForwardEngine:
         final_eval_dir = outdir / "final_report"
         final_eval = self._evaluator(input_csv, best_composed_xlsx, timeframe, final_eval_dir)
 
-        # Build regime summary:
-        # - profit_trades/profit_buyhold may be NaN if not provided by tuner; keep empty unless available.
-        # - marginal_contribution is computed from selection steps deltas when a regime is accepted.
+        # Build regime summary from FINAL COMPOSED evaluation.
+        # IMPORTANT:
+        # - do not reuse standalone per-regime metrics stored in RegimeBlock here,
+        #   because they refer to isolated regime evaluations and can mismatch
+        #   against the final composed strategy metrics.
         mc_by_regime: Dict[str, float] = {}
         for st in steps:
             if st.accepted:
                 mc_by_regime[st.candidate] = st.alpha_delta
 
+        by_entry_regime: Dict[str, Any] = {}
+        final_eval_extras = getattr(final_eval, "extras", {}) or {}
+        if isinstance(final_eval_extras, dict):
+            by_entry_regime = final_eval_extras.get("by_entry_regime", {}) or {}
+
+        regime_to_entry_label = {
+            "G_RANGE": "RANGE",
+            "G_LATERAL": "LATERAL",
+            "G_TREND_UP": "TREND_UP",
+            "G_TREND_DOWN": "TREND_DOWN",
+        }
+
         for r in spec.candidate_regimes:
-            block = tuned_blocks.get(r)
             enabled = r in selected
-            profit_trades = block.profit_trades if block else float("nan")
-            profit_buyhold = block.profit_buyhold if block else float("nan")
-            alpha_r = block.alpha_regime if block else float("nan")
-            n_trades = block.n_trades if block else 0
-            mc = mc_by_regime.get(r, 0.0 if not enabled else mc_by_regime.get(r, 0.0))
+            mc = mc_by_regime.get(r, 0.0)
+
+            entry_label = regime_to_entry_label.get(r)
+            regime_stats = by_entry_regime.get(entry_label, {}) if entry_label else {}
+
+            profit_trades = regime_stats.get("profit", float("nan"))
+            n_trades = int(regime_stats.get("trade_count", 0)) if regime_stats else 0
+
             summary_rows[r] = RegimeSummaryRow(
                 regime=r,
                 enabled=enabled,
                 profit_trades=profit_trades,
-                profit_buyhold=profit_buyhold,
-                alpha=alpha_r,
+                profit_buyhold=float("nan"),
+                alpha=float("nan"),
                 n_trades=n_trades,
                 marginal_contribution=mc,
             )
@@ -547,7 +566,8 @@ class RegimeForwardEngine:
         print(f"Trades before: {before.n_trades_closed} | Trades after: {after.n_trades_closed}")
         print("")
         while True:
-            ans = input("Abilitare il trading per questo regime? [y/n] ").strip().lower()
+            print("Abilitare il trading per questo regime? [y/n]", flush=True)
+            ans = input("> ").strip().lower()
             if ans in ("y", "yes"):
                 return True
             if ans in ("n", "no"):
@@ -592,9 +612,11 @@ class RegimeForwardEngine:
         )
         print("")
         while True:
-            ans = input(
-                "Accettare comunque questo regime nonostante il drawdown più alto? [y/n] "
-            ).strip().lower()
+            print(
+                "Accettare comunque questo regime nonostante il drawdown più alto? [y/n]",
+                flush=True,
+            )
+            ans = input("> ").strip().lower()
             if ans in ("y", "yes"):
                 return True
             if ans in ("n", "no"):

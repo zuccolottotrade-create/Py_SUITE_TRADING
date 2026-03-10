@@ -80,6 +80,327 @@ class TrialRow:
     trial_config_xlsx: str
     eval_dir: str
 
+def _read_trade_profit_list_from_signal_dir(signal_dir: object) -> list[float]:
+    if signal_dir is None:
+        return []
+
+    try:
+        p = Path(str(signal_dir))
+    except Exception:
+        return []
+
+    if not p.exists():
+        return []
+
+    if p.is_file():
+        candidates = [p]
+    else:
+        candidates = [
+            x for x in p.rglob("SIGNAL_*.csv")
+            if x.is_file() and not x.name.startswith("TRADE_FREQ_")
+        ]
+
+    if not candidates:
+        return []
+
+    candidates = sorted(candidates, key=lambda x: x.stat().st_mtime, reverse=True)
+    signal_csv = candidates[0]
+
+    try:
+        df = pd.read_csv(signal_csv, sep=";", engine="python")
+    except Exception:
+        return []
+
+    if "Profit/Trade" not in df.columns:
+        return []
+
+    vals = []
+    for v in df["Profit/Trade"].tolist():
+        num = _to_float_maybe(v)
+        if num is not None:
+            vals.append(num)
+
+    return vals
+
+def _fmt2(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"", "nan", "none", "null"}:
+            return ""
+        num = _to_float_maybe(value)
+        if num is None:
+            return value
+        return f"{num:.2f}".replace(".", ",")
+
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    return f"{v:.2f}".replace(".", ",")
+
+
+def _to_float_maybe(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        s = s.replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def _safe_profit_per_trade(profit: object, trade_count: object) -> float | None:
+    p = _to_float_maybe(profit)
+    n = _to_float_maybe(trade_count)
+
+    if p is None or n is None:
+        return None
+
+    try:
+        n_int = int(n)
+    except Exception:
+        return None
+
+    if n_int <= 0:
+        return None
+
+    return p / n_int
+
+def _read_trade_profit_list_from_best_xlsx(best_xlsx: object) -> list[float]:
+    """
+    Given per-regime best.xlsx, search its sibling regime directory recursively
+    for the most relevant SIGNAL_*.csv and return the list of non-null Profit/Trade values.
+    """
+    if best_xlsx is None:
+        return []
+
+    try:
+        best_path = Path(str(best_xlsx))
+    except Exception:
+        return []
+
+    if not best_path.exists():
+        return []
+
+    regime_dir = best_path.parent
+
+    try:
+        candidates = [
+            p for p in regime_dir.rglob("SIGNAL_*.csv")
+            if p.is_file() and not p.name.startswith("TRADE_FREQ_")
+        ]
+    except Exception:
+        return []
+
+    if not candidates:
+        return []
+
+    # Prefer deeper/newer artifacts, usually under report/ or eval/ of the best trial.
+    candidates = sorted(
+        candidates,
+        key=lambda p: (len(p.parts), p.stat().st_mtime),
+        reverse=True,
+    )
+
+    signal_csv = candidates[0]
+
+    try:
+        df = pd.read_csv(signal_csv, sep=";", engine="python")
+    except Exception:
+        return []
+
+    if "Profit/Trade" not in df.columns:
+        return []
+
+    vals = []
+    for v in df["Profit/Trade"].tolist():
+        num = _to_float_maybe(v)
+        if num is not None:
+            vals.append(num)
+
+    return vals
+
+
+def _fmt_trade_list(values: list[float]) -> str:
+    if not values:
+        return ""
+    return ", ".join(_fmt2(v) for v in values)
+
+def _decode_regime_code(value: object) -> str:
+    v = _to_float_maybe(value)
+    if v is None:
+        return ""
+
+    code = int(v)
+    mapping = {
+        0: "LATERAL",
+        1: "RANGE",
+        2: "VOLATILE",
+        3: "TREND_UP",
+        4: "TREND_DOWN",
+    }
+    return mapping.get(code, str(code))
+
+
+def _read_final_composed_signal_csv(
+    outdir: Path,
+    selection_result: dict | None,
+) -> Path | None:
+    """
+    Resolve the canonical SIGNAL csv of the final composed strategy.
+
+    Priority:
+    1) final_report/SIGNAL_*.csv
+    2) last accepted forward-selection step under selection/eval/step_XX_<REGIME>
+    """
+    outdir = Path(outdir)
+
+    # 1) Canonical final report location
+    final_report_dir = outdir / "final_report"
+    if final_report_dir.exists():
+        candidates = [
+            p for p in final_report_dir.rglob("SIGNAL_*.csv")
+            if p.is_file() and not p.name.startswith("TRADE_FREQ_")
+        ]
+        if candidates:
+            candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+            return candidates[0]
+
+    # 2) Fallback: last accepted step in selection/eval
+    if not selection_result:
+        return None
+
+    selected = selection_result.get("selected_regimes") or []
+    if not selected:
+        return None
+
+    last_idx = len(selected) - 1
+    last_candidate = selected[-1]
+    step_name = f"step_{last_idx:02d}_{last_candidate}"
+
+    step_dir = outdir / "selection" / "eval" / step_name
+    if not step_dir.exists():
+        return None
+
+    candidates = [
+        p for p in step_dir.rglob("SIGNAL_*.csv")
+        if p.is_file() and not p.name.startswith("TRADE_FREQ_")
+    ]
+    if not candidates:
+        return None
+
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+def _read_final_composed_trade_rows(
+    outdir: Path,
+    selection_result: dict | None,
+) -> list[dict[str, object]]:
+    """
+    Return vertical trade-detail rows for the final composed strategy:
+    #trade, Profit del Trade, regime apertura, regime chiusura
+
+    Notes:
+    - Profit/Trade is read from the final SIGNAL csv.
+    - Regime apertura / chiusura are mapped from dedicated columns if present.
+    - If only a generic REGIME_L1_CODE column exists, it is used as fallback.
+    """
+    signal_csv = _read_final_composed_signal_csv(outdir, selection_result)
+    if signal_csv is None:
+        return []
+
+    try:
+        df = pd.read_csv(signal_csv, sep=";", engine="python")
+    except Exception:
+        return []
+
+    if "Profit/Trade" not in df.columns:
+        return []
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+
+    preferred_open = [
+        "regime_open",
+        "entry_regime",
+        "REGIME_OPEN",
+        "ENTRY_REGIME",
+        "regime_at_entry",
+        "REGIME_AT_ENTRY",
+        "REGIME_L1_CODE_entry",
+        "REGIME_L1_CODE_ENTRY",
+    ]
+    preferred_close = [
+        "regime_close",
+        "exit_regime",
+        "REGIME_CLOSE",
+        "EXIT_REGIME",
+        "regime_at_exit",
+        "REGIME_AT_EXIT",
+        "REGIME_L1_CODE_exit",
+        "REGIME_L1_CODE_EXIT",
+    ]
+
+    open_regime_col = next((cols[n] for n in preferred_open if n in cols), None)
+    close_regime_col = next((cols[n] for n in preferred_close if n in cols), None)
+    generic_regime_col = cols.get("regime_l1_code")
+
+    out_rows: list[dict[str, object]] = []
+    trade_no = 0
+
+    for _, row in df.iterrows():
+        profit = _to_float_maybe(row.get("Profit/Trade"))
+        if profit is None:
+            continue
+
+        trade_no += 1
+
+        regime_open = ""
+        regime_close = ""
+
+        if open_regime_col is not None:
+            regime_open = str(row.get(open_regime_col) or "").strip()
+        elif generic_regime_col is not None:
+            regime_open = _decode_regime_code(row.get(generic_regime_col))
+
+        if close_regime_col is not None:
+            regime_close = str(row.get(close_regime_col) or "").strip()
+        elif generic_regime_col is not None:
+            regime_close = _decode_regime_code(row.get(generic_regime_col))
+
+        out_rows.append(
+            {
+                "trade_no": trade_no,
+                "profit_per_trade": profit,
+                "regime_open": regime_open,
+                "regime_close": regime_close,
+            }
+        )
+
+    return out_rows
+
+
 
 def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -542,7 +863,12 @@ def run_autotune_v1(
     space = build_space_from_tuning(config_strategy, active_group=active_group)
 
     if not space.params:
-        print(f"[WARN] No tunable parameters for group={active_group}. Running baseline evaluation.")
+        print(
+            f"[WARN] No tunable parameters for group={active_group}. "
+            "Skipping tuning and evaluating baseline regime block. "
+            "This regime can still be proposed during forward selection "
+            "if its baseline block improves the composed strategy."
+        )
 
         evaluator = StrategyEvaluator()
 
@@ -877,14 +1203,24 @@ def run_autotune_regimes_v1(
             # Keep per-regime autotune robust even if selection metadata cannot be built
             pass
 
+        best_profit_num = _to_float_maybe(best_profit)
+        best_alpha_num = _to_float_maybe(best_alpha)
+        best_trades_num = _to_float_maybe(best_trades)
+
         summary_rows.append(
             {
                 "group": group_name,
-                "profit": best_profit,
-                "trade_count": best_trades,
-                "alpha_vs_buyhold": best_alpha,
-                "max_drawdown": best_dd,
-                "score": best_score,
+                "profit": best_profit_num if best_profit_num is not None else best_profit,
+                "trade_count": int(best_trades_num) if best_trades_num is not None else best_trades,
+                "profit_per_trade": _safe_profit_per_trade(best_profit_num, best_trades_num),
+                "buy_hold_profit": (
+                    best_profit_num - best_alpha_num
+                    if best_profit_num is not None and best_alpha_num is not None
+                    else None
+                ),
+                "alpha_vs_buyhold": best_alpha_num if best_alpha_num is not None else best_alpha,
+                "max_drawdown": _to_float_maybe(best_dd) if _to_float_maybe(best_dd) is not None else best_dd,
+                "score": _to_float_maybe(best_score) if _to_float_maybe(best_score) is not None else best_score,
                 "standalone_hint": decision_hint,
                 "best_xlsx": str(best_xlsx),
             }
@@ -970,7 +1306,7 @@ def run_autotune_regimes_v1(
                     penalty=penalty_val,
                     buy_hold_filo=buy_hold_val,
                     net_profit_strat=profit_val,
-                    extras={},
+                    extras=getattr(ev.metrics, "extras", {}) or {},
                 )
 
             def _forward_builder(
@@ -1036,10 +1372,66 @@ def run_autotune_regimes_v1(
 
     # Legacy per-regime summary (not the composed final report)
     summary_csv = outdir / "per_regime_summary.csv"
+
+    standalone_profit_sum = 0.0
+    standalone_trade_sum = 0
+    standalone_has_profit = False
+
+    for r in summary_rows:
+        p = _to_float_maybe(r.get("profit"))
+        n = _to_float_maybe(r.get("trade_count"))
+
+        if p is not None:
+            standalone_profit_sum += p
+            standalone_has_profit = True
+
+        if n is not None:
+            standalone_trade_sum += int(n)
+
+    overall_profit = standalone_profit_sum if standalone_has_profit else None
+    overall_trades = standalone_trade_sum
+    overall_ppt = _safe_profit_per_trade(overall_profit, overall_trades)
+
+    # Keep composed-final metrics separate for the dedicated section below.
+    if selection_result and isinstance(selection_result, dict):
+        final_eval = selection_result.get("final_eval") or {}
+        overall_buy_hold = final_eval.get("buy_hold_filo")
+    else:
+        final_eval = {}
+        overall_buy_hold = None
+
+    overall_alpha = (
+        overall_profit - overall_buy_hold
+        if overall_profit is not None and overall_buy_hold is not None
+        else None
+    )
+
+    # Not meaningful as standalone aggregates in this summary row.
+    overall_dd = None
+    overall_score = None
+
+    summary_rows_out = list(summary_rows)
+    summary_rows_out.append(
+        {
+            "group": "OVERALL",
+            "profit": overall_profit,
+            "trade_count": overall_trades,
+            "profit_per_trade": overall_ppt,
+            "buy_hold_profit": overall_buy_hold,
+            "alpha_vs_buyhold": overall_alpha,
+            "max_drawdown": overall_dd,
+            "score": overall_score,
+            "standalone_hint": "",
+            "best_xlsx": "",
+        }
+    )
+
     fieldnames = [
         "group",
         "profit",
         "trade_count",
+        "profit_per_trade",
+        "buy_hold_profit",
         "alpha_vs_buyhold",
         "max_drawdown",
         "score",
@@ -1050,41 +1442,130 @@ def run_autotune_regimes_v1(
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
         w.writeheader()
-        for row in summary_rows:
+        for row in summary_rows_out:
             w.writerow({k: _fmt_eu_num(v) for k, v in row.items()})
 
     # final console summary
     try:
-        df_summary = pd.DataFrame(summary_rows)
+        df_summary = pd.DataFrame(summary_rows_out)
 
         if not df_summary.empty:
+            non_overall = df_summary[df_summary["group"] != "OVERALL"].copy()
+            overall_only = df_summary[df_summary["group"] == "OVERALL"].copy()
 
-            if "score" in df_summary.columns:
-                df_summary = df_summary.sort_values(by="score", ascending=False, na_position="last")
+            if "score" in non_overall.columns:
+                non_overall = non_overall.sort_values(by="score", ascending=False, na_position="last")
+
+            df_summary_print = pd.concat([non_overall, overall_only], ignore_index=True)
 
             printable_cols = [
                 c for c in [
                     "group",
                     "profit",
                     "trade_count",
+                    "profit_per_trade",
+                    "buy_hold_profit",
                     "alpha_vs_buyhold",
                     "max_drawdown",
                     "score",
                     "standalone_hint",
                 ]
-                if c in df_summary.columns
+                if c in df_summary_print.columns
             ]
 
-            df_print = df_summary[printable_cols].copy()
+            df_print = df_summary_print[printable_cols].copy()
 
-            for col in ["profit", "alpha_vs_buyhold", "max_drawdown", "score"]:
+            for col in [
+                "profit",
+                "profit_per_trade",
+                "buy_hold_profit",
+                "alpha_vs_buyhold",
+                "max_drawdown",
+                "score",
+            ]:
                 if col in df_print.columns:
-                    df_print[col] = df_print[col].map(_fmt_eu_num)
+                    df_print[col] = df_print[col].map(_fmt2)
 
-            print("\n=== REGIME SUMMARY ===")
+            if "trade_count" in df_print.columns:
+                df_print["trade_count"] = df_print["trade_count"].map(
+                    lambda x: "" if pd.isna(x) else str(int(x))
+                )
+
+            print(
+                "\n[NOTE] Le sezioni STANDALONE descrivono i blocchi regime isolati; "
+                "le sezioni FINAL COMPOSED descrivono la strategia finale composta letta dal SIGNAL_* canonico."
+            )
+            print("\n=== REGIME SUMMARY (STANDALONE TUNED BLOCKS) ===")
             print(df_print.to_string(index=False))
-            print(f"\nSaved: {summary_csv}")
+
+            print("\n=== PROFIT / TRADE BY REGIME (STANDALONE) ===")
+            ppt_cols = [c for c in ["group", "profit_per_trade", "trade_count", "profit"] if c in df_print.columns]
+            print(df_print[ppt_cols].to_string(index=False))
+
+        print("\n=== OVERALL STRATEGY VS BUY&HOLD (FINAL COMPOSED SIGNAL) ===")
+        final_profit = final_eval.get("net_profit_strat") if isinstance(final_eval, dict) else None
+        final_buy_hold = final_eval.get("buy_hold_filo") if isinstance(final_eval, dict) else None
+        final_alpha = final_eval.get("alpha") if isinstance(final_eval, dict) else None
+        final_trades = final_eval.get("n_trades_closed") if isinstance(final_eval, dict) else None
+        final_dd = final_eval.get("max_dd") if isinstance(final_eval, dict) else None
+        final_ppt = _safe_profit_per_trade(final_profit, final_trades)
+
+        print(f"Strategy Profit : {_fmt2(final_profit)}")
+        print(f"Buy&Hold Profit : {_fmt2(final_buy_hold)}")
+        print(f"Alpha           : {_fmt2(final_alpha)}")
+        print(f"Trade Count     : {'' if final_trades is None else int(final_trades)}")
+        print(f"Profit/Trade    : {_fmt2(final_ppt)}")
+        print(f"Max Drawdown    : {_fmt2(final_dd)}")
+        print("\n=== SINGLE PROFIT / TRADE LIST (STANDALONE) ===")
+        for _, r in df_summary_print.iterrows():
+            group = r.get("group")
+            if group == "OVERALL":
+                continue
+
+            ppt = _fmt2(r.get("profit_per_trade"))
+            trades = r.get("trade_count")
+            profit = _fmt2(r.get("profit"))
+            trades_txt = "" if pd.isna(trades) else str(int(trades))
+
+            print(f"- {group}: Profit/Trade={ppt} | Trades={trades_txt} | Profit={profit}")
+
+        print("\n=== SINGLE TRADE PROFITS BY REGIME (STANDALONE) ===")
+        for _, r in df_summary_print.iterrows():
+            group = r.get("group")
+            if group == "OVERALL":
+                continue
+
+            trade_values = _read_trade_profit_list_from_best_xlsx(r.get("best_xlsx"))
+            trade_list_txt = _fmt_trade_list(trade_values)
+
+            if trade_list_txt:
+                print(f"- {group}: {trade_list_txt}")
+            else:
+                print(f"- {group}: (nessun trade)")
+
+        print("\n=== FINAL COMPOSED TRADE DETAIL ===")
+        try:
+            final_trade_rows = _read_final_composed_trade_rows(outdir, selection_result)
+        except Exception:
+            final_trade_rows = []
+
+        if final_trade_rows:
+            print(f"Trade count: {len(final_trade_rows)}")
+            print("#trade; Profit del Trade; Regime apertura; Regime chiusura")
+
+            for r in final_trade_rows:
+                print(
+                    f"{r['trade_no']}; "
+                    f"{_fmt2(r['profit_per_trade'])}; "
+                    f"{r['regime_open']}; "
+                    f"{r['regime_close']}"
+                )
+        else:
+            print("(no composed trades found)")
+
+        print(f"\nSaved: {summary_csv}")
     except Exception as e:
         print(f"\n[WARN] Could not print regime summary table: {e}")
 
+    return outdir
     return outdir

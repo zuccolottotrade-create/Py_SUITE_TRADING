@@ -22,6 +22,7 @@ class EvalMetrics:
     max_drawdown: Optional[float]
     alpha_vs_buyhold: Optional[float]
     buy_hold_profit: Optional[float]
+    extras: dict
 
 
 @dataclass
@@ -169,9 +170,15 @@ class StrategyEvaluator:
             signal_csv = self._find_signal_csv(outdir=outdir, input_csv=input_csv)
             metrics = self._parse_metrics(signal_csv=signal_csv)
 
+            error = None
+            if proc.returncode != 0:
+                error = f"run_strategia failed with returncode={proc.returncode}"
+            elif signal_csv is None:
+                error = "SIGNAL csv not found in evaluation outdir"
+
             return EvalResult(
-                ok=(proc.returncode == 0 and signal_csv is not None),
-                error=None if signal_csv is not None else "SIGNAL csv not found",
+                ok=(error is None),
+                error=error,
                 returncode=proc.returncode,
                 metrics=metrics,
                 stdout=proc.stdout,
@@ -187,7 +194,7 @@ class StrategyEvaluator:
                 ok=False,
                 error="evaluation timeout",
                 returncode=124,
-                metrics=EvalMetrics(None, None, None, None, None, None),
+                metrics=EvalMetrics(None, None, None, None, None, None, {}),
                 stdout=exc.stdout or "",
                 stderr=exc.stderr or "",
                 artifacts_dir=outdir,
@@ -202,7 +209,7 @@ class StrategyEvaluator:
                 ok=False,
                 error=str(exc),
                 returncode=1,
-                metrics=EvalMetrics(None, None, None, None, None, None),
+                metrics=EvalMetrics(None, None, None, None, None, None, {}),
                 stdout="",
                 stderr="",
                 artifacts_dir=outdir,
@@ -217,7 +224,7 @@ class StrategyEvaluator:
     def _parse_metrics(self, signal_csv: Path | None) -> EvalMetrics:
 
         if signal_csv is None or not Path(signal_csv).exists():
-            return EvalMetrics(None, None, None, None, None, None)
+            return EvalMetrics(None, None, None, None, None, None, {})
 
         df = pd.read_csv(signal_csv, sep=";", engine="python")
 
@@ -231,6 +238,7 @@ class StrategyEvaluator:
         buy_hold_profit = None
         alpha_vs_buyhold = None
         max_drawdown = 0.0
+        extras: dict = {}
 
         if "Profit/Trade" in df.columns:
             trade_pnl = pd.to_numeric(df["Profit/Trade"], errors="coerce").dropna()
@@ -256,6 +264,47 @@ class StrategyEvaluator:
         if buy_hold_profit is not None:
             alpha_vs_buyhold = float(profit - buy_hold_profit)
 
+        # -------------------------------------------------------
+        # Breakdown per regime dal SIGNAL_* finale
+        # Preferiamo Entry_Regime esplicito; fallback su REGIME_L1_RAW
+        # solo se Entry_Regime non è disponibile.
+        # -------------------------------------------------------
+        regime_col = None
+        if "Entry_Regime" in df.columns:
+            regime_col = "Entry_Regime"
+        elif "REGIME_L1_RAW" in df.columns:
+            regime_col = "REGIME_L1_RAW"
+        elif "REGIME_L1" in df.columns:
+            regime_col = "REGIME_L1"
+        elif "REGIME_L1_CODE" in df.columns:
+            regime_col = "REGIME_L1_CODE"
+
+        if "Profit/Trade" in df.columns and regime_col is not None:
+            closed_mask = pd.to_numeric(df["Profit/Trade"], errors="coerce").notna()
+            closed = df.loc[closed_mask, [regime_col, "Profit/Trade"]].copy()
+
+            if len(closed):
+                closed["Profit/Trade"] = pd.to_numeric(closed["Profit/Trade"], errors="coerce")
+                closed = closed.dropna(subset=["Profit/Trade"])
+
+                by_entry_regime = {}
+                for reg_key, sub in closed.groupby(regime_col, sort=True):
+                    vals = pd.to_numeric(sub["Profit/Trade"], errors="coerce").dropna()
+                    n = int(len(vals))
+                    if n == 0:
+                        continue
+
+                    net = float(vals.sum())
+                    ppt = float(net / n) if n else 0.0
+
+                    by_entry_regime[str(reg_key)] = {
+                        "profit": net,
+                        "trade_count": n,
+                        "profit_per_trade": ppt,
+                    }
+
+                extras["by_entry_regime"] = by_entry_regime
+
         return EvalMetrics(
             profit=profit,
             profit_per_trade=profit_per_trade,
@@ -263,27 +312,37 @@ class StrategyEvaluator:
             max_drawdown=max_drawdown,
             alpha_vs_buyhold=alpha_vs_buyhold,
             buy_hold_profit=buy_hold_profit,
+            extras=extras,
         )
+
 
     # ===============================
     # Signal CSV discovery
     # ===============================
 
     def _find_signal_csv(self, outdir: Path | None, input_csv: Path) -> Path | None:
+        """
+        Resolve SIGNAL csv produced by the current evaluation.
 
-        candidates = []
-
+        IMPORTANT:
+        - If outdir is provided, search ONLY inside outdir.
+          This avoids picking stale SIGNAL files from shared locations
+          such as input_csv.parent (e.g. _data/Test Data).
+        - Fallback to input_csv.parent is allowed only when outdir is None.
+        """
         if outdir is not None:
             outdir = Path(outdir)
-            if outdir.exists():
-                candidates.extend(sorted(outdir.rglob("SIGNAL_*.csv")))
+            if not outdir.exists():
+                return None
 
-        default_signal = input_csv.parent / f"SIGNAL_{input_csv.name}"
+            candidates = sorted(outdir.rglob("SIGNAL_*.csv"))
+            return candidates[0] if candidates else None
+
+        default_signal = Path(input_csv).parent / f"SIGNAL_{Path(input_csv).name}"
         if default_signal.exists():
-            candidates.append(default_signal)
+            return default_signal
 
-        return candidates[0] if candidates else None
-
+        return None
     # ===============================
     # Error result
     # ===============================
@@ -293,7 +352,7 @@ class StrategyEvaluator:
             ok=False,
             error=msg,
             returncode=code,
-            metrics=EvalMetrics(None, None, None, None, None, None),
+            metrics=EvalMetrics(None, None, None, None, None, None, {}),
             stdout="",
             stderr="",
             artifacts_dir=outdir,
