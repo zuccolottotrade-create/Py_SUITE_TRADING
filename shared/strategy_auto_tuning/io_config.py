@@ -24,7 +24,7 @@ from typing import Any, Optional
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
-
+import shutil
 
 DEFAULT_TUNING_SHEET = "TUNING"
 
@@ -110,6 +110,79 @@ def write_tuning_sheet(
     else:
         # keep silent by default (engine can log)
         pass
+
+def build_regime_wise_config_v3(
+    base_xlsx_path: str | Path,
+    out_xlsx_path: str | Path,
+    *,
+    target_group: str,
+    conditions_sheet_name: str = "CONDITIONS",
+    logger: Optional[Any] = None,
+) -> Path:
+    """
+    Build a temporary config_strategy workbook for regime-wise v3 evaluation.
+
+    Semantics:
+    - full dataset is kept unchanged outside this function
+    - only CONDITIONS sheet is edited
+    - rows with group == target_group are enabled
+    - rows with any other non-empty group are disabled
+    - blank group rows are left unchanged
+    """
+    base_xlsx_path = Path(base_xlsx_path)
+    out_xlsx_path = Path(out_xlsx_path)
+
+    if not base_xlsx_path.exists():
+        raise FileNotFoundError(str(base_xlsx_path))
+
+    out_xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(base_xlsx_path, out_xlsx_path)
+
+    wb = load_workbook(out_xlsx_path)
+
+    if conditions_sheet_name not in wb.sheetnames:
+        raise ValueError(
+            f"Missing sheet '{conditions_sheet_name}' in {out_xlsx_path.name}"
+        )
+
+    ws = wb[conditions_sheet_name]
+
+    header = [ws.cell(row=1, column=j).value for j in range(1, ws.max_column + 1)]
+    header_norm = {str(v).strip().lower(): j for j, v in enumerate(header, start=1) if v is not None}
+
+    if "group" not in header_norm:
+        raise ValueError(
+            f"Missing required column 'group' in sheet '{conditions_sheet_name}'"
+        )
+    if "enabled" not in header_norm:
+        raise ValueError(
+            f"Missing required column 'enabled' in sheet '{conditions_sheet_name}'"
+        )
+
+    col_group = header_norm["group"]
+    col_enabled = header_norm["enabled"]
+
+    target_group_norm = str(target_group).strip()
+
+    for i in range(2, ws.max_row + 1):
+        group_val = ws.cell(row=i, column=col_group).value
+        group_str = "" if group_val is None else str(group_val).strip()
+
+        # Leave rows without group untouched
+        if not group_str:
+            continue
+
+        ws.cell(row=i, column=col_enabled, value=(group_str == target_group_norm))
+
+    wb.save(out_xlsx_path)
+
+    if logger is not None and hasattr(logger, "info"):
+        logger.info(
+            f"[IO] wrote regime-wise v3 config: {out_xlsx_path} "
+            f"(target_group={target_group_norm})"
+        )
+
+    return out_xlsx_path
 
 
 def _write_dataframe_to_sheet(ws: Worksheet, df: pd.DataFrame) -> None:

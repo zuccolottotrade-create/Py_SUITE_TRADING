@@ -299,10 +299,7 @@ class RegimeForwardEngine:
             if not candidates:
                 break
 
-            best_r: Optional[str] = None
-            best_eval: Optional[EvalResult] = None
-            best_eval_dir: Optional[Path] = None
-            best_xlsx_path: Optional[Path] = None
+            ranked_candidates: List[Tuple[str, EvalResult, Path, Path]] = []
 
             for r in candidates:
                 # compose S ∪ {r}
@@ -311,97 +308,130 @@ class RegimeForwardEngine:
                 self._builder(base_config_xlsx, [tuned_blocks[x] for x in (selected + [r])], composed_xlsx)
 
                 res = self._evaluator(input_csv, composed_xlsx, timeframe, eval_dir)
+                ranked_candidates.append((r, res, eval_dir, composed_xlsx))
 
-                # Higher score is better, consistent with engine.py / trials.csv ranking
-                if best_eval is None or res.score > best_eval.score:
-                    best_r = r
-                    best_eval = res
-                    best_eval_dir = eval_dir
-                    best_xlsx_path = composed_xlsx
-
-            if best_r is None or best_eval is None or best_eval_dir is None or best_xlsx_path is None:
+            if not ranked_candidates:
                 break
 
-            # constraints
-            ok_constraints, reason_constraints = passes_constraints(current, best_eval)
+            ranked_candidates.sort(key=lambda x: x[1].score, reverse=True)
 
-            # show trade report (optional) before asking user
-            if self._trade_reporter is not None:
-                try:
-                    self._trade_reporter(best_eval_dir, best_r)
-                except Exception:
-                    # do not fail selection due to reporting
-                    pass
-
+            chosen_r: Optional[str] = None
+            chosen_eval: Optional[EvalResult] = None
+            chosen_eval_dir: Optional[Path] = None
+            chosen_xlsx_path: Optional[Path] = None
+            chosen_ok_constraints = False
+            chosen_reason = "no_candidate_evaluated"
             accepted = False
-            reason = reason_constraints
 
-            if ok_constraints:
+            fallback_r, fallback_eval, fallback_eval_dir, fallback_xlsx_path = ranked_candidates[0]
+
+            for r, res, eval_dir, composed_xlsx in ranked_candidates:
+                ok_constraints, reason_constraints = passes_constraints(current, res)
+
+                if not ok_constraints:
+                    continue
+
+                # show trade report (optional) before asking user
+                if self._trade_reporter is not None:
+                    try:
+                        self._trade_reporter(eval_dir, r)
+                    except Exception:
+                        # do not fail selection due to reporting
+                        pass
+
+                candidate_accepted = False
+                candidate_reason = reason_constraints
+
                 if spec.auto_accept and not spec.interactive:
-                    accepted = True
-                    reason = "auto_accept_noninteractive"
+                    candidate_accepted = True
+                    candidate_reason = "auto_accept_noninteractive"
                 elif spec.auto_accept and spec.interactive:
                     # keep deterministic: auto_accept overrides user interaction
-                    accepted = True
-                    reason = "auto_accept"
+                    candidate_accepted = True
+                    candidate_reason = "auto_accept"
                 elif spec.interactive:
-                    accepted = self._ask_user_accept(best_r, current, best_eval)
-                    reason = "user_yes" if accepted else "user_no"
+                    candidate_accepted = self._ask_user_accept(r, current, res)
+                    candidate_reason = "user_yes" if candidate_accepted else "user_no"
                 else:
                     # non-interactive and not auto-accept: accept if improves
-                    accepted = True
-                    reason = "accepted_noninteractive"
-            else:
-                # Optional interactive override only for DD-only rejection cases:
-                # candidate improves score/alpha, evaluator is ok, but fails solely
-                # because drawdown increase is above tolerance.
-                is_dd_only_rejection = (
-                    spec.interactive
-                    and best_eval.ok
-                    and reason_constraints.startswith("dd_increase_above_tolerance")
-                    and best_eval.alpha >= current.alpha + spec.eps_alpha
-                    and best_eval.n_trades_closed >= spec.n_trades_min
-                    and best_eval.score > current.score
-                )
-                if is_dd_only_rejection:
-                    accepted = self._ask_user_accept_dd_override(best_r, current, best_eval, reason_constraints)
-                    reason = "user_override_dd" if accepted else "user_declined_dd_override"
+                    candidate_accepted = True
+                    candidate_reason = "accepted_noninteractive"
+
+                chosen_r = r
+                chosen_eval = res
+                chosen_eval_dir = eval_dir
+                chosen_xlsx_path = composed_xlsx
+                chosen_ok_constraints = ok_constraints
+                chosen_reason = candidate_reason
+                accepted = candidate_accepted
+
+                if candidate_accepted:
+                    break
+
+            if chosen_r is None or chosen_eval is None or chosen_eval_dir is None or chosen_xlsx_path is None:
+                # Nessun candidato passa i constraint:
+                # usa il best-by-score come fallback per log e possibile deroga esplicita.
+                chosen_r = fallback_r
+                chosen_eval = fallback_eval
+                chosen_eval_dir = fallback_eval_dir
+                chosen_xlsx_path = fallback_xlsx_path
+                chosen_ok_constraints, chosen_reason = passes_constraints(current, chosen_eval)
+                accepted = False
+
+                # show trade report (optional) before asking user
+                if self._trade_reporter is not None:
+                    try:
+                        self._trade_reporter(chosen_eval_dir, chosen_r)
+                    except Exception:
+                        # do not fail selection due to reporting
+                        pass
+
+                if spec.interactive:
+                    accepted = self._ask_user_accept_constraints_override(
+                        chosen_r,
+                        current,
+                        chosen_eval,
+                        chosen_reason,
+                    )
+                    chosen_reason = "user_override_constraints" if accepted else chosen_reason
 
             # Log step
             step = SelectionStep(
                 step=step_idx + 1,
                 s_before=_join_regimes(selected),
-                candidate=best_r,
-                s_after=_join_regimes(selected + ([best_r] if accepted else [])),
+                candidate=chosen_r,
+                s_after=_join_regimes(selected + ([chosen_r] if accepted else [])),
                 score_before=current.score,
-                score_after=best_eval.score,
+                score_after=chosen_eval.score,
                 alpha_before=current.alpha,
-                alpha_after=best_eval.alpha,
-                alpha_delta=best_eval.alpha - current.alpha,
+                alpha_after=chosen_eval.alpha,
+                alpha_delta=chosen_eval.alpha - current.alpha,
                 dd_before=current.max_dd,
-                dd_after=best_eval.max_dd,
-                dd_delta=best_eval.max_dd - current.max_dd,
+                dd_after=chosen_eval.max_dd,
+                dd_delta=chosen_eval.max_dd - current.max_dd,
                 trades_before=current.n_trades_closed,
-                trades_after=best_eval.n_trades_closed,
-                trades_delta=best_eval.n_trades_closed - current.n_trades_closed,
-                ok_after=best_eval.ok,
+                trades_after=chosen_eval.n_trades_closed,
+                trades_delta=chosen_eval.n_trades_closed - current.n_trades_closed,
+                ok_after=chosen_eval.ok,
                 accepted=accepted,
-                reason=reason,
+                reason=chosen_reason,
             )
             steps.append(step)
 
             # Apply decision
             if accepted:
-                selected.append(best_r)
-                current = best_eval
-                current_xlsx = best_xlsx_path
+                selected.append(chosen_r)
+                current = chosen_eval
+                current_xlsx = chosen_xlsx_path
             else:
-                rejected.append(best_r)
+                rejected.append(chosen_r)
 
-            # Stopping rule: if nothing can be accepted anymore, break early
-            # (simple heuristic: if best candidate fails constraints, no need to continue)
-            if not ok_constraints:
+            # Stopping rule:
+            # stop only if no candidate has been accepted in this step.
+            if not accepted:
                 break
+
+            step_idx += 1
 
             step_idx += 1
 
@@ -541,6 +571,7 @@ class RegimeForwardEngine:
             "best_composed_xlsx": str(best_composed_xlsx),
             "selection_log_csv": str(selection_log_csv),
             "regime_summary_csv": str(regime_summary_csv),
+            "evaluation_semantics": "v3_full_dataset_target_entries_only_for_per_regime_blocks",
         }
         result_json.write_text(json.dumps(result_payload, indent=2), encoding="utf-8")
 
@@ -623,7 +654,52 @@ class RegimeForwardEngine:
                 return False
             print("Risposta non valida. Inserisci 'y' oppure 'n'.")
 
+    def _ask_user_accept_constraints_override(
+        self,
+        regime: str,
+        before: EvalResult,
+        after: EvalResult,
+        rejection_reason: str,
+    ) -> bool:
+        """
+        Ask the user whether to override a generic constraint rejection.
 
+        Used when no candidate in the current step passes the automatic policy,
+        but we still want to give the user the option to accept the best-by-score
+        candidate explicitly.
+        """
+        print("")
+        print("=== REGIME PROPOSAL (POLICY OVERRIDE) ===")
+        print(f"Regime: {regime}")
+        print(f"Motivo blocco automatico: {rejection_reason}")
+        print(
+            f"Alpha before: {_eu_num(before.alpha)}  | "
+            f"Alpha after: {_eu_num(after.alpha)}  | "
+            f"Delta: {_eu_num(after.alpha - before.alpha)}"
+        )
+        print(
+            f"Score before: {_eu_num(before.score)}  | "
+            f"Score after: {_eu_num(after.score)}"
+        )
+        print(
+            f"DD before: {_eu_num(before.max_dd)}     | "
+            f"DD after: {_eu_num(after.max_dd)}     | "
+            f"Delta: {_eu_num(after.max_dd - before.max_dd)}"
+        )
+        print(
+            f"Trades before: {before.n_trades_closed} | "
+            f"Trades after: {after.n_trades_closed} | "
+            f"Delta: {after.n_trades_closed - before.n_trades_closed}"
+        )
+        print("")
+        while True:
+            print("Accettare comunque questo regime in deroga alla policy? [y/n]", flush=True)
+            ans = input("> ").strip().lower()
+            if ans in ("y", "yes"):
+                return True
+            if ans in ("n", "no"):
+                return False
+            print("Risposta non valida. Inserisci 'y' oppure 'n'.")
 # -----------------------------
 # Convenience wrapper (for engine.py)
 # -----------------------------

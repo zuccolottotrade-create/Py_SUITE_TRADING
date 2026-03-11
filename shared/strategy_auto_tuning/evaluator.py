@@ -216,6 +216,39 @@ class StrategyEvaluator:
                 run_script=self.run_script,
 
             )
+    def evaluate_regime_wise_v3(
+        self,
+        *,
+        input_csv: Path,
+        config_strategy: Path,
+        timeframe: str,
+        outdir: Path | None = None,
+        timeout_sec: int = 300,
+        target_regime_name: str,
+    ) -> EvalResult:
+        """
+        Regime-wise evaluation v3:
+        - always run on full dataset
+        - config_strategy must already enforce target-only entries
+        - exits remain free according to strategy rules
+        """
+        result = self.evaluate(
+            input_csv=input_csv,
+            config_strategy=config_strategy,
+            timeframe=timeframe,
+            outdir=outdir,
+            timeout_sec=timeout_sec,
+        )
+
+        extras = dict(getattr(result.metrics, "extras", {}) or {})
+        extras["regime_eval_mode"] = "v3_full_dataset_target_entries_only"
+        extras["target_regime_name"] = str(target_regime_name).strip()
+        extras["input_csv_full_dataset"] = str(Path(input_csv))
+
+        result.metrics.extras = extras
+        return result
+
+
 
     # ===============================
     # Metrics parser
@@ -239,6 +272,7 @@ class StrategyEvaluator:
         alpha_vs_buyhold = None
         max_drawdown = 0.0
         extras: dict = {}
+        extras["signal_csv"] = str(signal_csv) if signal_csv is not None else None
 
         if "Profit/Trade" in df.columns:
             trade_pnl = pd.to_numeric(df["Profit/Trade"], errors="coerce").dropna()
