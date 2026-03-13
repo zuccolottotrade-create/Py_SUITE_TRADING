@@ -91,6 +91,7 @@ class SelectionStep:
 
     ok_after: bool
     accepted: bool
+    decision: str
     reason: str
 
 # NOTE:
@@ -196,6 +197,37 @@ def _join_regimes(rs: Sequence[str]) -> str:
 # Core engine
 # -----------------------------
 
+CANONICAL_REGIME_GROUPS = {
+    "G_RANGE",
+    "G_LATERAL",
+    "G_VOLATILE",
+    "G_TREND_UP",
+    "G_TREND_DOWN",
+}
+
+LEGACY_EXCLUDED_REGIME_GROUPS = {
+    "G_TREND",
+}
+
+def _filter_operational_candidates(groups: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+
+    for g in groups:
+        gs = str(g).strip().upper()
+        if not gs:
+            continue
+        if gs in LEGACY_EXCLUDED_REGIME_GROUPS:
+            continue
+        if gs not in CANONICAL_REGIME_GROUPS:
+            continue
+        if gs in seen:
+            continue
+        seen.add(gs)
+        out.append(gs)
+
+    return out
+
 class RegimeForwardEngine:
     """
     Forward selection over regimes.
@@ -241,6 +273,20 @@ class RegimeForwardEngine:
         outdir = Path(outdir)
         outdir.mkdir(parents=True, exist_ok=True)
 
+        raw_candidate_regimes = list(spec.candidate_regimes)
+        legacy_present = [
+            str(g).strip().upper()
+            for g in raw_candidate_regimes
+            if str(g).strip().upper() in LEGACY_EXCLUDED_REGIME_GROUPS
+        ]
+        if legacy_present:
+            print(
+                "[INFO] Ignoro gruppi legacy non operativi: "
+                + ", ".join(sorted(set(legacy_present)))
+            )
+
+        candidate_regimes = _filter_operational_candidates(raw_candidate_regimes)
+
         # runspec (minimal)
         runspec = {
             "ts": _now_ts(),
@@ -248,7 +294,8 @@ class RegimeForwardEngine:
             "timeframe": timeframe,
             "input_csv": str(Path(input_csv)),
             "base_config_xlsx": str(Path(base_config_xlsx)),
-            "candidate_regimes": list(spec.candidate_regimes),
+            "candidate_regimes": list(candidate_regimes),
+            "candidate_regimes_raw": list(spec.candidate_regimes),
             "eps_alpha": spec.eps_alpha,
             "dd_tolerance_ratio": spec.dd_tolerance_ratio,
             "n_trades_min": spec.n_trades_min,
@@ -256,9 +303,9 @@ class RegimeForwardEngine:
             "auto_accept": spec.auto_accept,
         }
         (outdir / "runspec.json").write_text(json.dumps(runspec, indent=2), encoding="utf-8")
-
         # Baseline = evaluate composed strategy with S = {}
         selected: List[str] = []
+        joint_opt: List[str] = []
         rejected: List[str] = []
         steps: List[SelectionStep] = []
 
@@ -289,13 +336,56 @@ class RegimeForwardEngine:
                         return False, f"dd_increase_above_tolerance({spec.dd_tolerance_ratio})"
             return True, "ok"
 
+        def standalone_is_credible(block: RegimeBlock) -> bool:
+            if block is None:
+                return False
+            if block.n_trades <= 0:
+                return False
+            if not math.isfinite(block.profit_trades):
+                return False
+            if block.profit_trades <= 0:
+                return False
+            return True
+
+        def classify_rejection(before: EvalResult, after: EvalResult, regime: str, rejection_reason: str) -> Tuple[str, bool, str]:
+            """
+            Returns: (decision, accepted, reason)
+            decision ∈ {PROMOTE, KEEP_FOR_JOINT_OPT, DROP_HARD}
+            """
+            block = tuned_blocks.get(regime)
+
+            if rejection_reason.startswith("alpha_not_improving_eps("):
+                if standalone_is_credible(block):
+                    return "KEEP_FOR_JOINT_OPT", False, "alpha_not_improving_keep_for_joint_opt"
+                return "DROP_HARD", False, "alpha_not_improving_and_standalone_weak"
+
+            if rejection_reason.startswith("n_trades_below_min("):
+                return "DROP_HARD", False, rejection_reason
+
+            if rejection_reason.startswith("dd_increase_above_tolerance("):
+                if standalone_is_credible(block):
+                    return "KEEP_FOR_JOINT_OPT", False, "dd_above_tolerance_keep_for_joint_opt"
+                return "DROP_HARD", False, rejection_reason
+
+            if rejection_reason == "evaluator_not_ok":
+                return "DROP_HARD", False, rejection_reason
+
+            if standalone_is_credible(block):
+                return "KEEP_FOR_JOINT_OPT", False, f"{rejection_reason}_keep_for_joint_opt"
+
+            return "DROP_HARD", False, rejection_reason
+
         # Loop
         step_idx = 0
-        remaining = [r for r in spec.candidate_regimes if r in tuned_blocks]
+
+        remaining = [r for r in candidate_regimes if r in tuned_blocks]
 
         while remaining and len(selected) < spec.max_regimes:
             # Evaluate all candidates not yet selected/rejected
-            candidates = [r for r in remaining if (r not in selected and r not in rejected)]
+            candidates = [
+                r for r in remaining
+                if (r not in selected and r not in joint_opt and r not in rejected)
+            ]
             if not candidates:
                 break
 
@@ -321,6 +411,7 @@ class RegimeForwardEngine:
             chosen_xlsx_path: Optional[Path] = None
             chosen_ok_constraints = False
             chosen_reason = "no_candidate_evaluated"
+            chosen_decision = "DROP_HARD"
             accepted = False
 
             fallback_r, fallback_eval, fallback_eval_dir, fallback_xlsx_path = ranked_candidates[0]
@@ -363,6 +454,7 @@ class RegimeForwardEngine:
                 chosen_xlsx_path = composed_xlsx
                 chosen_ok_constraints = ok_constraints
                 chosen_reason = candidate_reason
+                chosen_decision = "PROMOTE"
                 accepted = candidate_accepted
 
                 if candidate_accepted:
@@ -370,13 +462,18 @@ class RegimeForwardEngine:
 
             if chosen_r is None or chosen_eval is None or chosen_eval_dir is None or chosen_xlsx_path is None:
                 # Nessun candidato passa i constraint:
-                # usa il best-by-score come fallback per log e possibile deroga esplicita.
+                # usa il best-by-score come fallback per log e classificazione.
                 chosen_r = fallback_r
                 chosen_eval = fallback_eval
                 chosen_eval_dir = fallback_eval_dir
                 chosen_xlsx_path = fallback_xlsx_path
                 chosen_ok_constraints, chosen_reason = passes_constraints(current, chosen_eval)
-                accepted = False
+                chosen_decision, accepted, chosen_reason = classify_rejection(
+                    current,
+                    chosen_eval,
+                    chosen_r,
+                    chosen_reason,
+                )
 
                 # show trade report (optional) before asking user
                 if self._trade_reporter is not None:
@@ -386,21 +483,31 @@ class RegimeForwardEngine:
                         # do not fail selection due to reporting
                         pass
 
-                if spec.interactive:
-                    accepted = self._ask_user_accept_constraints_override(
-                        chosen_r,
-                        current,
-                        chosen_eval,
-                        chosen_reason,
-                    )
-                    chosen_reason = "user_override_constraints" if accepted else chosen_reason
+            if spec.interactive and chosen_decision == "KEEP_FOR_JOINT_OPT":
+                accepted = self._ask_user_accept_constraints_override(
+                    chosen_r,
+                    current,
+                    chosen_eval,
+                    chosen_reason,
+                )
+                if accepted:
+                    chosen_reason = "user_override_constraints"
+                else:
+                    chosen_decision = "DROP_HARD"
+                    chosen_reason = "user_rejected_joint_opt"
 
             # Log step
+            s_after_list = list(selected)
+            if chosen_decision == "PROMOTE" and accepted:
+                s_after_list.append(chosen_r)
+            elif chosen_decision == "KEEP_FOR_JOINT_OPT":
+                s_after_list.append(f"{chosen_r}[JOINT]")
+
             step = SelectionStep(
                 step=step_idx + 1,
                 s_before=_join_regimes(selected),
                 candidate=chosen_r,
-                s_after=_join_regimes(selected + ([chosen_r] if accepted else [])),
+                s_after=_join_regimes(s_after_list),
                 score_before=current.score,
                 score_after=chosen_eval.score,
                 alpha_before=current.alpha,
@@ -414,30 +521,47 @@ class RegimeForwardEngine:
                 trades_delta=chosen_eval.n_trades_closed - current.n_trades_closed,
                 ok_after=chosen_eval.ok,
                 accepted=accepted,
+                decision=chosen_decision,
                 reason=chosen_reason,
             )
             steps.append(step)
 
             # Apply decision
-            if accepted:
-                selected.append(chosen_r)
+            if chosen_decision == "PROMOTE" and accepted:
+                if chosen_r not in selected:
+                    selected.append(chosen_r)
                 current = chosen_eval
                 current_xlsx = chosen_xlsx_path
+            elif chosen_decision == "KEEP_FOR_JOINT_OPT":
+                if chosen_r not in joint_opt:
+                    joint_opt.append(chosen_r)
             else:
-                rejected.append(chosen_r)
+                if chosen_r not in rejected:
+                    rejected.append(chosen_r)
 
             # Stopping rule:
-            # stop only if no candidate has been accepted in this step.
-            if not accepted:
+            # stop only on hard drop / no viable continuation.
+            # KEEP_FOR_JOINT_OPT must not terminate the screening loop.
+            if not accepted and chosen_decision == "DROP_HARD":
                 break
 
             step_idx += 1
-
-            step_idx += 1
+            continue
 
         # Write best composed artifact
         best_composed_xlsx = outdir / "selection" / "best_composed.xlsx"
-        self._builder(base_config_xlsx, [tuned_blocks[r] for r in selected], best_composed_xlsx)
+        final_regimes_for_build: List[str] = []
+        seen_final: set[str] = set()
+        for r in _filter_operational_candidates(list(selected) + list(joint_opt)):
+            if r not in seen_final:
+                seen_final.add(r)
+                final_regimes_for_build.append(r)
+
+        self._builder(
+            base_config_xlsx,
+            [tuned_blocks[r] for r in final_regimes_for_build],
+            best_composed_xlsx,
+        )
 
         # Evaluate final composed (for final_report)
         final_eval_dir = outdir / "final_report"
@@ -465,8 +589,8 @@ class RegimeForwardEngine:
             "G_TREND_DOWN": "TREND_DOWN",
         }
 
-        for r in spec.candidate_regimes:
-            enabled = r in selected
+        for r in candidate_regimes:
+            enabled = r in final_regimes_for_build
             mc = mc_by_regime.get(r, 0.0)
 
             entry_label = regime_to_entry_label.get(r)
@@ -507,6 +631,7 @@ class RegimeForwardEngine:
                 "trades_delta",
                 "ok_after",
                 "accepted",
+                "decision",
                 "reason",
             ],
             rows=[
@@ -528,6 +653,7 @@ class RegimeForwardEngine:
                     s.trades_delta,
                     s.ok_after,
                     s.accepted,
+                    s.decision,
                     s.reason,
                 ]
                 for s in steps
@@ -557,7 +683,7 @@ class RegimeForwardEngine:
                     row.n_trades,
                     row.marginal_contribution,
                 ]
-                for row in (summary_rows[r] for r in spec.candidate_regimes if r in summary_rows)
+                for row in (summary_rows[r] for r in candidate_regimes if r in summary_rows)
             ],
         )
 
@@ -565,7 +691,9 @@ class RegimeForwardEngine:
         result_json = outdir / "selection" / "selection_result.json"
         result_payload = {
             "selected_regimes": selected,
+            "joint_opt_regimes": joint_opt,
             "rejected_regimes": rejected,
+            "final_regimes_for_build": final_regimes_for_build,
             "baseline": asdict(baseline),
             "final_eval": asdict(final_eval),
             "best_composed_xlsx": str(best_composed_xlsx),

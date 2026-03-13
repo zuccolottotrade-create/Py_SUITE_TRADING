@@ -959,11 +959,15 @@ def _is_enabled_cell(value) -> bool:
     s = _norm_upper(value)
     return s in {"TRUE", "1", "YES", "Y", "ON"}
 
-
 def detect_entry_groups(config_strategy) -> list[str]:
     """
     Rileva i group che hanno almeno una riga ENTRY abilitata
     nel foglio CONDITIONS del workbook config_strategy.
+
+    Nota architetturale:
+    G_TREND non è un gruppo operativo del framework.
+    I soli regimi trend validi per strategy design, autotuning e selection
+    sono G_TREND_UP e G_TREND_DOWN.
     """
     path = Path(config_strategy)
     wb = load_workbook(path, data_only=False)
@@ -983,11 +987,24 @@ def detect_entry_groups(config_strategy) -> list[str]:
     if not required.issubset(idx.keys()):
         return []
 
+    CANONICAL_REGIME_GROUPS = {
+        "G_RANGE",
+        "G_LATERAL",
+        "G_VOLATILE",
+        "G_TREND_UP",
+        "G_TREND_DOWN",
+    }
+
+    LEGACY_EXCLUDED_REGIME_GROUPS = {
+        "G_TREND",
+    }
+
     out = []
     seen = set()
+    ignored_legacy = set()
 
     for row in rows[1:]:
-        group = _norm_text(row[idx["group"]])
+        group = _norm_upper(row[idx["group"]])
         scope = _norm_upper(row[idx["scope"]])
         enabled = row[idx["enabled"]]
 
@@ -998,9 +1015,22 @@ def detect_entry_groups(config_strategy) -> list[str]:
         if not _is_enabled_cell(enabled):
             continue
 
+        if group in LEGACY_EXCLUDED_REGIME_GROUPS:
+            ignored_legacy.add(group)
+            continue
+
+        if group not in CANONICAL_REGIME_GROUPS:
+            continue
+
         if group not in seen:
             seen.add(group)
             out.append(group)
+
+    if ignored_legacy:
+        print(
+            "[INFO] Ignoro gruppi legacy non operativi: "
+            + ", ".join(sorted(ignored_legacy))
+        )
 
     return out
 
@@ -1319,7 +1349,42 @@ def _merge_forward_tuning_from_blocks(
         tuning_df=merged_df,
         out_xlsx_path=out_config_path,
     )
+CANONICAL_REGIME_GROUPS = {
+    "G_RANGE",
+    "G_LATERAL",
+    "G_VOLATILE",
+    "G_TREND_UP",
+    "G_TREND_DOWN",
+}
 
+LEGACY_EXCLUDED_REGIME_GROUPS = {
+    "G_TREND",
+}
+
+def _is_canonical_regime_group(group_name: str) -> bool:
+    return str(group_name).strip().upper() in CANONICAL_REGIME_GROUPS
+
+def _is_legacy_excluded_regime_group(group_name: str) -> bool:
+    return str(group_name).strip().upper() in LEGACY_EXCLUDED_REGIME_GROUPS
+
+def _filter_operational_regime_groups(groups: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for g in groups:
+        gs = str(g).strip().upper()
+        if not gs:
+            continue
+        if _is_legacy_excluded_regime_group(gs):
+            continue
+        if not _is_canonical_regime_group(gs):
+            continue
+        if gs in seen:
+            continue
+        seen.add(gs)
+        out.append(gs)
+
+    return out
 
 def _is_global_group(group_value: Any) -> bool:
     """
@@ -1333,6 +1398,18 @@ def _is_global_group(group_value: Any) -> bool:
     g = _normalize_group(group_value).upper()
     return g in {"G_ANY"}
 
+
+def _read_trade_profit_list_from_best_signal(best_xlsx_path) -> list[float]:
+    """
+    Backward-compatible shim.
+
+    IMPORTANT:
+    - Use the same trade extraction semantics as the canonical standalone summary:
+      every non-null Profit/Trade value from the resolved SIGNAL_*.csv is a closed trade.
+    - Do NOT drop zero-profit trades.
+    - Do NOT use ad-hoc CSV parsing that may disagree with evaluator.py.
+    """
+    return _read_trade_profit_list_from_best_xlsx(best_xlsx_path)
 
 def _write_forward_baseline_config(
     *,
@@ -1721,6 +1798,7 @@ def run_autotune_regimes_v1(
     final_report_dir.mkdir(exist_ok=True)
 
     detected_groups = detect_entry_groups(config_strategy)
+    detected_groups = _filter_operational_regime_groups(detected_groups)
     print(f"[DBG] detect_entry_groups config_strategy = {Path(config_strategy).resolve()}")
     print(f"[DBG] detected_groups = {detected_groups}")
 
@@ -1809,6 +1887,7 @@ def run_autotune_regimes_v1(
         best_trial_id = None
         best_trial_config_xlsx = None
         selected_best_xlsx = best_xlsx
+        selected_best_eval_dir = None
 
         df_sorted = pd.DataFrame()
 
@@ -1844,6 +1923,13 @@ def run_autotune_regimes_v1(
 
                 best_trial_id = best.get("trial_id")
                 best_trial_config_raw = best.get("trial_config_xlsx")
+                best_eval_dir_raw = best.get("eval_dir")
+
+                if best_eval_dir_raw is not None and str(best_eval_dir_raw).strip():
+                    try:
+                        selected_best_eval_dir = Path(str(best_eval_dir_raw))
+                    except Exception:
+                        selected_best_eval_dir = None
 
                 if best_trial_config_raw is not None:
                     try:
@@ -1957,6 +2043,7 @@ def run_autotune_regimes_v1(
                 "score": _to_float_maybe(best_score) if _to_float_maybe(best_score) is not None else best_score,
                 "standalone_hint": decision_hint,
                 "best_xlsx": str(selected_best_xlsx),
+                "eval_dir": str(selected_best_eval_dir) if selected_best_eval_dir else "",
                 "gate_check_ok": gate_check_ok,
                 "bad_entry_count": bad_entry_count,
             }
@@ -1968,6 +2055,12 @@ def run_autotune_regimes_v1(
     selection_result = None
     try:
         candidate_regimes = [g for g in target_groups if g in tuned_blocks]
+
+        # v2.1:
+        # no hard-coded restriction of candidate regimes here.
+        # Candidate screening / promotion / keep-for-joint-opt / hard-drop
+        # must be decided by forward selection logic, not by an ad-hoc local filter.
+        candidate_regimes = list(candidate_regimes)
 
         if candidate_regimes:
             fs_spec = ForwardSelectionSpec(
@@ -2140,11 +2233,23 @@ def run_autotune_regimes_v1(
     try:
         selected_groups_for_export: list[str] = []
         if isinstance(selection_result, dict):
-            selected_groups_for_export = [
+            selected_groups = [
                 str(x).strip()
                 for x in (selection_result.get("selected_regimes") or [])
                 if str(x).strip()
             ]
+            joint_opt_groups = [
+                str(x).strip()
+                for x in (selection_result.get("joint_opt_regimes") or [])
+                if str(x).strip()
+            ]
+
+            seen_groups: set[str] = set()
+            selected_groups_for_export = []
+            for g in selected_groups + joint_opt_groups:
+                if g not in seen_groups:
+                    seen_groups.add(g)
+                    selected_groups_for_export.append(g)
 
         best_composed_xlsx = _resolve_best_composed_xlsx(outdir, selection_result)
 
@@ -2240,6 +2345,7 @@ def run_autotune_regimes_v1(
         "score",
         "standalone_hint",
         "best_xlsx",
+        "eval_dir",
         "gate_check_ok",
         "bad_entry_count",
     ]
@@ -2340,13 +2446,43 @@ def run_autotune_regimes_v1(
             if group == "OVERALL":
                 continue
 
-            trade_values = _read_trade_profit_list_from_best_xlsx(r.get("best_xlsx"))
+            best_xlsx = r.get("best_xlsx")
+            eval_dir = r.get("eval_dir")
+
+            trade_values = _read_trade_profit_list_from_signal_dir(eval_dir)
+
+            if not trade_values:
+                trade_values = _read_trade_profit_list_from_best_xlsx(best_xlsx)
+
+            if not trade_values:
+                trade_values = _read_trade_profit_list_from_best_signal(best_xlsx)
+
             trade_list_txt = _fmt_trade_list(trade_values)
 
+            expected_trades = r.get("trade_count")
+            try:
+                expected_trades_int = 0 if pd.isna(expected_trades) else int(expected_trades)
+            except Exception:
+                expected_trades_int = None
+
+            actual_trades_int = len(trade_values)
+
             if trade_list_txt:
-                print(f"- {group}: {trade_list_txt}")
+                if expected_trades_int is not None and expected_trades_int != actual_trades_int:
+                    print(
+                        f"- {group}: {trade_list_txt} "
+                        f"[WARN count_mismatch summary={expected_trades_int} list={actual_trades_int}]"
+                    )
+                else:
+                    print(f"- {group}: {trade_list_txt}")
             else:
-                print(f"- {group}: (nessun trade)")
+                if expected_trades_int not in (None, 0):
+                    print(
+                        f"- {group}: (nessun trade) "
+                        f"[WARN count_mismatch summary={expected_trades_int} list=0]"
+                    )
+                else:
+                    print(f"- {group}: (nessun trade)")
 
         print("\n=== FINAL COMPOSED TRADE DETAIL ===")
         try:
