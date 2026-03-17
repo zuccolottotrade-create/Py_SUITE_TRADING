@@ -895,7 +895,20 @@ def _import_report_tools(suite_root: Path):
 
 from shared.regime_auto_calibration.engine import _get_default_target_bands
 
+def build_regime_output_path(in_file: Path) -> Path:
+    """
+    Costruisce il path del CSV operativo post-regime
+    da usare poi in Run_strategia.
+    """
+    parent = in_file.parent
+    stem = in_file.stem
 
+    if stem.startswith("KPI_"):
+        out_name = f"KPI_REGIME_{stem[4:]}.csv"
+    else:
+        out_name = f"KPI_REGIME_{stem}.csv"
+
+    return parent / out_name
 
 # ============================================================
 # REGIME_L1 – Target di riferimento
@@ -1295,48 +1308,59 @@ def main() -> int:
     print("======================================")
 
     # STEP 1: scegli filtro regime_* da /shared
-    regime_module = _pick_regime_module(shared_dir)
-    apply_fn = _load_regime_apply(regime_module, shared_dir)
+    # con retry se il filtro scelto fallisce in fase di apply
+    while True:
+        regime_module = _pick_regime_module(shared_dir)
+        apply_fn = _load_regime_apply(regime_module, shared_dir)
 
-    # STEP 2: change defaults? (stub)
-    if _ask_yes_no("Vuoi cambiare i valori di default?", default_yes=False):
-        print("\n[TODO] Routine 'Filtro Regime – modifica parametri' non ancora implementata.")
-        print("      Proseguo con i default del modulo.\n")
-        # in futuro: qui generi/aggiorni un dict config e lo passi ad apply_fn(df, config=...)
+        # STEP 2: change defaults? (stub)
+        if _ask_yes_no("Vuoi cambiare i valori di default?", default_yes=False):
+            print("\n[TODO] Routine 'Filtro Regime – modifica parametri' non ancora implementata.")
+            print("      Proseguo con i default del modulo.\n")
+            # in futuro: qui generi/aggiorni un dict config e lo passi ad apply_fn(df, config=...)
 
-    # STEP 3: repo input
-    in_repo = _ask_path("Conferma repository di INPUT", default_in_repo)
+        # STEP 3: repo input
+        in_repo = _ask_path("Conferma repository di INPUT", default_in_repo)
 
+        # STEP 4: repo output
+        out_repo = _ask_path("Conferma repository di OUTPUT", default_out_repo)
+        out_repo.mkdir(parents=True, exist_ok=True)
 
-    # STEP 4: repo output
-    out_repo = _ask_path("Conferma repository di OUTPUT", default_out_repo)
+        # STEP 5: scegli file KPI_ (obbligatorio)
+        in_file = _pick_file_interactive(in_repo, prefix="KPI_")
+        print(f"\n[INFO] Input selezionato: {in_file.name}")
 
-    out_repo.mkdir(parents=True, exist_ok=True)
+        # load CSV (mantieni prudente: dtype=str)
+        df = pd.read_csv(in_file, sep=";", low_memory=False)
 
-    # STEP 5: scegli file KPI_ (obbligatorio)
-    in_file = _pick_file_interactive(in_repo, prefix="KPI_")
-    print(f"\n[INFO] Input selezionato: {in_file.name}")
-
-    # load CSV (mantieni prudente: dtype=str)
-    df = pd.read_csv(in_file, sep=";", low_memory=False)
-
-
-    # Normalizza TUTTE le colonne KPI_* in numerico (comma->dot)
-    kpi_cols = [c for c in df.columns if c.startswith("KPI_")]
-    for c in kpi_cols:
-        s = df[c].astype(str).str.replace(",", ".", regex=False)
-        df[c] = pd.to_numeric(s, errors="coerce")
-
-
-    # Normalizza numerici base (comma->dot) se presenti
-    for c in ("open", "high", "low", "close", "volume"):
-        if c in df.columns:
+        # Normalizza TUTTE le colonne KPI_* in numerico (comma->dot)
+        kpi_cols = [c for c in df.columns if c.startswith("KPI_")]
+        for c in kpi_cols:
             s = df[c].astype(str).str.replace(",", ".", regex=False)
             df[c] = pd.to_numeric(s, errors="coerce")
 
-    # Applica filtro
-    print(f"[INFO] Applico filtro regime: {regime_module}")
-    df2 = apply_fn(df)
+        # Normalizza numerici base (comma->dot) se presenti
+        for c in ("open", "high", "low", "close", "volume"):
+            if c in df.columns:
+                s = df[c].astype(str).str.replace(",", ".", regex=False)
+                df[c] = pd.to_numeric(s, errors="coerce")
+
+        try:
+            # Applica filtro
+            print(f"[INFO] Applico filtro regime: {regime_module}")
+            df2 = apply_fn(df)
+            break
+
+        except Exception as ex:
+            print()
+            print("❌❌❌  ERRORE APPLICAZIONE FILTRO REGIME  ❌❌❌")
+            print(f"Filtro selezionato: {regime_module}")
+            print(f"Dettaglio: {type(ex).__name__}: {ex}")
+            print()
+            print("La scelta del filtro di regime non è valida o il filtro non è applicabile.")
+            print("Ripropongo la selezione del filtro di regime.")
+            print()
+            continue
 
     def _num_safe(s: pd.Series) -> pd.Series:
         """
@@ -1730,14 +1754,32 @@ def main() -> int:
 
 
 
+    # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Salva anche il CSV operativo post-regime per Run_strategia
+    # Formato coerente con la suite:
+    # - separatore colonne = ;
+    # - decimale = ,
+    # ------------------------------------------------------------
+    out_data_path = build_regime_output_path(in_file)
+    df2.to_csv(
+        out_data_path,
+        sep=";",
+        decimal=",",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # ------------------------------------------------------------
+    # Salva il report CSV regime
+    # ------------------------------------------------------------
     out_name = f"REGIME_REPORT_{in_file.stem}.csv"
     out_path = out_repo / out_name
 
-
-
-
     write_single_csv_report(out_path, sheets)
 
+    print(f"[OK] File dati post-regime scritto: {out_data_path}")
+    print("[OK] Formato file dati post-regime: sep=';' decimal=',' encoding='utf-8-sig'")
     print(f"[OK] Report scritto: {out_path}")
     return 0
 
